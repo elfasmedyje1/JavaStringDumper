@@ -19,6 +19,10 @@ public class ENI_StringDumper {
     static String  OUT_DIR    = null;
     static boolean DO_REEXEC  = true;
 
+    static final Set<String> FLOW_STUB_CLASSES = Collections.newSetFromMap(new ConcurrentHashMap<>());
+    private static final Map<Class<?>, Field[]> FIELDS_CACHE = new ConcurrentHashMap<>();
+    private static final boolean IS_TERMINAL = System.console() != null;
+
     public static void main(String[] args) throws Exception {
         if (args.length < 1) { printUsage(); return; }
 
@@ -39,10 +43,12 @@ public class ENI_StringDumper {
 
         if (positional.isEmpty()) { printUsage(); return; }
 
+        FLOW_STUB_CLASSES.clear();
+
         String jarPath     = positional.get(0);
         String triggerSpec = positional.size() > 1 ? positional.get(1) : null;
 
-        File jarFile = new File(jarPath);
+        File jarFile = new File(jarPath).getAbsoluteFile();
         if (!jarFile.exists()) {
             System.err.println("[-] JAR not found: " + jarPath);
             return;
@@ -92,7 +98,7 @@ public class ENI_StringDumper {
         }
 
         System.out.println("[*] Analysing classes...");
-        Map<String, Set<String>> deps    = new HashMap<>();
+        Map<String, Set<String>> deps     = new HashMap<>();
         Map<String, StubInfo>    stubNeeds = new ConcurrentHashMap<>();
         combinedAnalysisPass(classBytes, deps, stubNeeds);
         List<String> sortedClasses = topologicalSort(classBytes.keySet(), deps);
@@ -126,8 +132,9 @@ public class ENI_StringDumper {
         Thread progressThread = new Thread(() -> {
             while (!Thread.currentThread().isInterrupted()) {
                 int d = done.get(), pct = total > 0 ? d * 100 / total : 100;
-                System.out.printf("\r    [%-40s] %d/%d (%d%%)  strings: %d",
-                        "=".repeat(pct * 40 / 100), d, total, pct, results.size());
+                if (IS_TERMINAL)
+                    System.out.printf("\r    [%-40s] %d/%d (%d%%)  strings: %d",
+                            "=".repeat(pct * 40 / 100), d, total, pct, results.size());
                 try { Thread.sleep(150); } catch (InterruptedException e) { break; }
             }
         });
@@ -136,11 +143,10 @@ public class ENI_StringDumper {
 
         CompletionService<ClassResult> cs = new ExecutorCompletionService<>(pool);
         for (String className : sortedClasses) {
-            final String cname = className;
-            final String triggerMethod = (triggerSpec != null && triggerSpec.startsWith(cname + "."))
-                    ? triggerSpec.substring(cname.length() + 1) : null;
+            final String triggerMethod = (triggerSpec != null && triggerSpec.startsWith(className + "."))
+                    ? triggerSpec.substring(className.length() + 1) : null;
             cs.submit(() -> {
-                ClassResult r = processClass(loader, cname, triggerMethod, results, errors, seenLines);
+                ClassResult r = processClass(loader, className, triggerMethod, results, errors, seenLines);
                 done.incrementAndGet();
                 return r;
             });
@@ -160,12 +166,18 @@ public class ENI_StringDumper {
                 errors.add("[EXEC_FAIL] " + fullCauseChain(e.getCause()));
             }
         }
+
+        pool.shutdownNow();
+        pool.awaitTermination(2, TimeUnit.SECONDS);
+
         progressThread.interrupt();
-        System.out.printf("\r    [%-40s] %d/%d (100%%)  strings: %d%n",
-                "=".repeat(40), total, total, results.size());
+        if (IS_TERMINAL)
+            System.out.printf("\r    [%-40s] %d/%d (100%%)  strings: %d%n",
+                    "=".repeat(40), total, total, results.size());
+        else
+            System.out.printf("    %d/%d (100%%)  strings: %d%n", total, total, results.size());
 
         System.setErr(originalErr);
-        pool.shutdownNow();
 
         String jarBaseName = jarFile.getName();
         if (jarBaseName.toLowerCase().endsWith(".jar"))
@@ -188,7 +200,8 @@ public class ENI_StringDumper {
             String pkg = pe.getKey();
             List<DumpEntry> pkgEntries = pe.getValue();
             File pkgFile = new File(outDir, "packages/" + pkg + ".log");
-            try (PrintWriter out = new PrintWriter(new FileWriter(pkgFile, java.nio.charset.StandardCharsets.UTF_8))) {
+            try (PrintWriter out = new PrintWriter(new OutputStreamWriter(
+                    new FileOutputStream(pkgFile), java.nio.charset.StandardCharsets.UTF_8))) {
                 out.println("# Package : " + pkg);
                 out.println("# Strings : " + pkgEntries.size());
                 out.println();
@@ -197,7 +210,8 @@ public class ENI_StringDumper {
             }
             if (DO_JSON) {
                 File pkgJson = new File(outDir, "packages/" + pkg + ".json");
-                try (PrintWriter out = new PrintWriter(new FileWriter(pkgJson, java.nio.charset.StandardCharsets.UTF_8))) {
+                try (PrintWriter out = new PrintWriter(new OutputStreamWriter(
+                        new FileOutputStream(pkgJson), java.nio.charset.StandardCharsets.UTF_8))) {
                     out.println("[");
                     for (int i = 0; i < pkgEntries.size(); i++) {
                         DumpEntry e = pkgEntries.get(i);
@@ -214,7 +228,8 @@ public class ENI_StringDumper {
         }
 
         File allStringsFile = new File(outDir, "all_strings.txt");
-        try (PrintWriter out = new PrintWriter(new FileWriter(allStringsFile, java.nio.charset.StandardCharsets.UTF_8))) {
+        try (PrintWriter out = new PrintWriter(new OutputStreamWriter(
+                new FileOutputStream(allStringsFile), java.nio.charset.StandardCharsets.UTF_8))) {
             for (DumpEntry e : sorted) out.println(escapeLog(e.value));
         }
 
@@ -226,7 +241,8 @@ public class ENI_StringDumper {
         }
 
         File errorFile = new File(outDir, "errors.log");
-        try (PrintWriter out = new PrintWriter(new FileWriter(errorFile, java.nio.charset.StandardCharsets.UTF_8))) {
+        try (PrintWriter out = new PrintWriter(new OutputStreamWriter(
+                new FileOutputStream(errorFile), java.nio.charset.StandardCharsets.UTF_8))) {
             out.println("# Error summary (" + errorList.size() + " total)");
             errorTypes.entrySet().stream()
                     .sorted(Map.Entry.<String, Integer>comparingByValue().reversed())
@@ -236,7 +252,8 @@ public class ENI_StringDumper {
         }
 
         File summaryFile = new File(outDir, "summary.txt");
-        try (PrintWriter out = new PrintWriter(new FileWriter(summaryFile, java.nio.charset.StandardCharsets.UTF_8))) {
+        try (PrintWriter out = new PrintWriter(new OutputStreamWriter(
+                new FileOutputStream(summaryFile), java.nio.charset.StandardCharsets.UTF_8))) {
             out.println("Target  : " + jarFile.getAbsolutePath());
             out.println("Date    : " + new java.util.Date());
             out.println();
@@ -398,8 +415,9 @@ public class ENI_StringDumper {
             return;
         }
         if (obj instanceof char[]) {
-            if (interestingChars((char[]) obj))
-                emit(results, seenLines, className, fieldName, prefix.isEmpty() ? null : prefix, new String((char[]) obj));
+            char[] arr = (char[]) obj;
+            if (interestingImpl(arr.length, i -> arr[i]))
+                emit(results, seenLines, className, fieldName, prefix.isEmpty() ? null : prefix, new String(arr));
             return;
         }
         if (obj instanceof byte[]) {
@@ -467,7 +485,7 @@ public class ENI_StringDumper {
             final Set<String> myDeps = new HashSet<>();
             deps.put(name, myDeps);
 
-            final int[] methodCount  = {0};
+            final int[]     methodCount   = {0};
             final boolean[] hasTimingCall = {false};
 
             try {
@@ -557,8 +575,10 @@ public class ENI_StringDumper {
         while (!queue.isEmpty()) {
             String cur = queue.poll();
             result.add(cur);
-            for (String dep : revDeps.getOrDefault(cur, Collections.emptySet()))
-                if (inDegree.merge(dep, -1, Integer::sum) == 0) queue.add(dep);
+            Set<String> dependents = revDeps.get(cur);
+            if (dependents != null)
+                for (String dep : dependents)
+                    if (inDegree.merge(dep, -1, Integer::sum) == 0) queue.add(dep);
         }
 
         if (result.size() < nodes.size()) {
@@ -581,7 +601,19 @@ public class ENI_StringDumper {
                 || name.startsWith("org.w3c.");
     }
 
-    static final Set<String> FLOW_STUB_CLASSES = Collections.newSetFromMap(new ConcurrentHashMap<>());
+    static void emitZeroReturn(MethodVisitor mv, String ret, String descriptor, int opcode) {
+        int slots = countArgSlots(descriptor, opcode != Opcodes.INVOKESTATIC);
+        for (int i = 0; i < slots; i++) mv.visitInsn(Opcodes.POP);
+        switch (ret) {
+            case "V":                                        break;
+            case "J": mv.visitInsn(Opcodes.LCONST_0);      break;
+            case "D": mv.visitInsn(Opcodes.DCONST_0);      break;
+            case "F": mv.visitInsn(Opcodes.FCONST_0);      break;
+            case "I": case "Z": case "B": case "C": case "S":
+                      mv.visitInsn(Opcodes.ICONST_0);       break;
+            default:  mv.visitInsn(Opcodes.ACONST_NULL);   break;
+        }
+    }
 
     static byte[] patchAntiAnalysis(byte[] classBytes) {
         try {
@@ -618,18 +650,7 @@ public class ENI_StringDumper {
                                         || mname.startsWith("compare") || mname.equals("allocateMemory")
                                         || mname.equals("freeMemory") || mname.equals("setMemory")
                                         || mname.equals("copyMemory") || mname.equals("ensureClassInitialized"))) {
-                                String ret = descriptor.substring(descriptor.lastIndexOf(')') + 1);
-                                int slots = countArgSlots(descriptor, opcode != Opcodes.INVOKESTATIC);
-                                for (int i = 0; i < slots; i++) super.visitInsn(Opcodes.POP);
-                                switch (ret) {
-                                    case "V":                                         break;
-                                    case "J": super.visitInsn(Opcodes.LCONST_0);    break;
-                                    case "D": super.visitInsn(Opcodes.DCONST_0);    break;
-                                    case "F": super.visitInsn(Opcodes.FCONST_0);    break;
-                                    case "I": case "Z": case "B": case "C": case "S":
-                                              super.visitInsn(Opcodes.ICONST_0);    break;
-                                    default:  super.visitInsn(Opcodes.ACONST_NULL); break;
-                                }
+                                emitZeroReturn(this, descriptor.substring(descriptor.lastIndexOf(')') + 1), descriptor, opcode);
                                 return;
                             }
                             if (owner.equals("java/lang/System")
@@ -650,18 +671,7 @@ public class ENI_StringDumper {
                                 super.visitInsn(Opcodes.POP); return;
                             }
                             if (FLOW_STUB_CLASSES.contains(owner.replace('/', '.'))) {
-                                String ret = descriptor.substring(descriptor.lastIndexOf(')') + 1);
-                                int slots = countArgSlots(descriptor, opcode != Opcodes.INVOKESTATIC);
-                                for (int i = 0; i < slots; i++) super.visitInsn(Opcodes.POP);
-                                switch (ret) {
-                                    case "V":                                         break;
-                                    case "J": super.visitInsn(Opcodes.LCONST_0);    break;
-                                    case "D": super.visitInsn(Opcodes.DCONST_0);    break;
-                                    case "F": super.visitInsn(Opcodes.FCONST_0);    break;
-                                    case "I": case "Z": case "B": case "C": case "S":
-                                              super.visitInsn(Opcodes.ICONST_0);    break;
-                                    default:  super.visitInsn(Opcodes.ACONST_NULL); break;
-                                }
+                                emitZeroReturn(this, descriptor.substring(descriptor.lastIndexOf(')') + 1), descriptor, opcode);
                                 return;
                             }
                             super.visitMethodInsn(opcode, owner, mname, descriptor, isInterface);
@@ -676,9 +686,9 @@ public class ENI_StringDumper {
     }
 
     static class GhostClassLoader extends URLClassLoader {
-        final Map<String, byte[]>   classBytes;
+        final Map<String, byte[]>  classBytes;
         private final Map<String, StubInfo>  stubNeeds;
-        private final Map<String, Class<?>> defined = new ConcurrentHashMap<>();
+        private final ConcurrentHashMap<String, Class<?>> defined = new ConcurrentHashMap<>();
 
         GhostClassLoader(URL[] urls, Map<String, byte[]> classBytes, Map<String, StubInfo> stubNeeds) {
             super(urls, null);
@@ -695,35 +705,31 @@ public class ENI_StringDumper {
                 return loadFromBytes(name, generateStub(stubNeeds.getOrDefault(name, new StubInfo(name, false))), resolve);
             if (classBytes.containsKey(name))
                 return loadFromBytes(name, classBytes.get(name), resolve);
-            if (DO_STUBS) {
-                StubInfo info = stubNeeds.getOrDefault(name, new StubInfo(name, false));
-                return loadFromBytes(name, generateStub(info), resolve);
-            }
+            if (DO_STUBS)
+                return loadFromBytes(name, generateStub(stubNeeds.getOrDefault(name, new StubInfo(name, false))), resolve);
             throw new ClassNotFoundException(name);
         }
 
-        private synchronized Class<?> loadFromBytes(String name, byte[] bytes, boolean resolve) {
-            Class<?> existing = defined.get(name);
-            if (existing != null) return existing;
-            byte[] patched = DO_PATCH ? patchAntiAnalysis(bytes) : bytes;
-            try {
-                Class<?> clazz = defineClass(name, patched, 0, patched.length);
-                defined.put(name, clazz);
-                if (resolve) resolveClass(clazz);
-                return clazz;
-            } catch (Throwable t) {
-                if (DO_PATCH && patched != bytes) {
-                    try {
-                        Class<?> clazz = defineClass(name, bytes, 0, bytes.length);
-                        defined.put(name, clazz);
-                        if (resolve) resolveClass(clazz);
-                        return clazz;
-                    } catch (Throwable t2) {
-                        throw new RuntimeException("defineClass failed for " + name, t2);
+        private Class<?> loadFromBytes(String name, byte[] bytes, boolean resolve) {
+            return defined.computeIfAbsent(name, k -> {
+                byte[] patched = DO_PATCH ? patchAntiAnalysis(bytes) : bytes;
+                try {
+                    Class<?> clazz = defineClass(k, patched, 0, patched.length);
+                    if (resolve) resolveClass(clazz);
+                    return clazz;
+                } catch (Throwable t) {
+                    if (DO_PATCH && patched != bytes) {
+                        try {
+                            Class<?> clazz = defineClass(k, bytes, 0, bytes.length);
+                            if (resolve) resolveClass(clazz);
+                            return clazz;
+                        } catch (Throwable t2) {
+                            throw new RuntimeException("defineClass failed for " + k, t2);
+                        }
                     }
+                    throw new RuntimeException("defineClass failed for " + k, t);
                 }
-                throw new RuntimeException("defineClass failed for " + name, t);
-            }
+            });
         }
 
         private static boolean isBootClass(String name) {
@@ -755,7 +761,7 @@ public class ENI_StringDumper {
         Set<String> added = new HashSet<>();
         for (MethodRef mref : info.methods) {
             if (mref.name.equals("<init>") || mref.name.equals("<clinit>")) continue;
-            if (!added.add(mref.name + mref.descriptor)) continue;
+            if (!added.add(mref.name + mref.descriptor + mref.isStatic)) continue;
 
             int mAccess = Opcodes.ACC_PUBLIC;
             if (mref.isStatic)    mAccess |= Opcodes.ACC_STATIC;
@@ -824,12 +830,12 @@ public class ENI_StringDumper {
         @Override public boolean equals(Object o) {
             if (!(o instanceof MethodRef)) return false;
             MethodRef r = (MethodRef) o;
-            return name.equals(r.name) && descriptor.equals(r.descriptor);
+            return isStatic == r.isStatic && name.equals(r.name) && descriptor.equals(r.descriptor);
         }
-        @Override public int hashCode() { return name.hashCode() * 31 + descriptor.hashCode(); }
+        @Override public int hashCode() {
+            return (name.hashCode() * 31 + descriptor.hashCode()) * 31 + Boolean.hashCode(isStatic);
+        }
     }
-
-    private static final Map<Class<?>, Field[]> FIELDS_CACHE = new ConcurrentHashMap<>();
 
     static Field[] cachedFields(Class<?> clazz) {
         return FIELDS_CACHE.computeIfAbsent(clazz, c -> {
@@ -850,29 +856,26 @@ public class ENI_StringDumper {
         }
     }
 
-    static boolean interesting(String s) {
-        if (s == null || s.length() < 3) return false;
+    private interface CharAt { char get(int i); }
+
+    private static boolean interestingImpl(int len, CharAt fn) {
+        if (len < 3) return false;
         int ctrl = 0, highByte = 0, printableAscii = 0;
-        for (int i = 0, len = s.length(); i < len; i++) {
-            char c = s.charAt(i);
+        for (int i = 0; i < len; i++) {
+            char c = fn.get(i);
             if (c < 0x20 && c != '\n' && c != '\r' && c != '\t') ctrl++;
             else if (c > 0x7e) highByte++;
             else printableAscii++;
         }
-        int len = s.length();
         return ctrl / (double) len < 0.15 && highByte / (double) len <= 0.40 && printableAscii >= 3;
     }
 
+    static boolean interesting(String s) {
+        return s != null && interestingImpl(s.length(), s::charAt);
+    }
+
     static boolean interestingChars(char[] arr) {
-        if (arr == null || arr.length < 3) return false;
-        int ctrl = 0, highByte = 0, printableAscii = 0;
-        for (char c : arr) {
-            if (c < 0x20 && c != '\n' && c != '\r' && c != '\t') ctrl++;
-            else if (c > 0x7e) highByte++;
-            else printableAscii++;
-        }
-        int len = arr.length;
-        return ctrl / (double) len < 0.15 && highByte / (double) len <= 0.40 && printableAscii >= 3;
+        return arr != null && interestingImpl(arr.length, i -> arr[i]);
     }
 
     static boolean isLikelyText(byte[] bytes) {
@@ -913,8 +916,15 @@ public class ENI_StringDumper {
                 case '\r': sb.append("\\r");  break;
                 case '\t': sb.append("\\t");  break;
                 default:
-                    if (c < 0x20) sb.append(String.format("\\u%04x", (int) c));
-                    else sb.append(c);
+                    if (c < 0x20) {
+                        sb.append("\\u");
+                        sb.append(Character.forDigit((c >> 12) & 0xF, 16));
+                        sb.append(Character.forDigit((c >>  8) & 0xF, 16));
+                        sb.append(Character.forDigit((c >>  4) & 0xF, 16));
+                        sb.append(Character.forDigit( c        & 0xF, 16));
+                    } else {
+                        sb.append(c);
+                    }
             }
         }
         sb.append("\"");
@@ -1012,8 +1022,16 @@ public class ENI_StringDumper {
     static int probeJvmVersion(String javaPath) {
         try {
             Process p = new ProcessBuilder(javaPath, "-version").redirectErrorStream(true).start();
-            String output = new String(readAllBytes(p.getInputStream()));
+            final byte[][] out = {null};
+            Thread drain = new Thread(() -> {
+                try { out[0] = readAllBytes(p.getInputStream()); } catch (Exception ignored) {}
+            });
+            drain.setDaemon(true);
+            drain.start();
             p.waitFor(5, TimeUnit.SECONDS);
+            drain.join(1000);
+            if (out[0] == null) return 0;
+            String output = new String(out[0]);
             java.util.regex.Matcher m = java.util.regex.Pattern
                     .compile("version \"(\\d+)(?:\\.(\\d+))?").matcher(output);
             if (m.find()) {
