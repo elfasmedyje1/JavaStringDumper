@@ -200,8 +200,7 @@ public class ENI_StringDumper {
             String pkg = pe.getKey();
             List<DumpEntry> pkgEntries = pe.getValue();
             File pkgFile = new File(outDir, "packages/" + pkg + ".log");
-            try (PrintWriter out = new PrintWriter(new OutputStreamWriter(
-                    new FileOutputStream(pkgFile), java.nio.charset.StandardCharsets.UTF_8))) {
+            try (PrintWriter out = openWriter(pkgFile)) {
                 out.println("# Package : " + pkg);
                 out.println("# Strings : " + pkgEntries.size());
                 out.println();
@@ -210,8 +209,7 @@ public class ENI_StringDumper {
             }
             if (DO_JSON) {
                 File pkgJson = new File(outDir, "packages/" + pkg + ".json");
-                try (PrintWriter out = new PrintWriter(new OutputStreamWriter(
-                        new FileOutputStream(pkgJson), java.nio.charset.StandardCharsets.UTF_8))) {
+                try (PrintWriter out = openWriter(pkgJson)) {
                     out.println("[");
                     for (int i = 0; i < pkgEntries.size(); i++) {
                         DumpEntry e = pkgEntries.get(i);
@@ -228,8 +226,7 @@ public class ENI_StringDumper {
         }
 
         File allStringsFile = new File(outDir, "all_strings.txt");
-        try (PrintWriter out = new PrintWriter(new OutputStreamWriter(
-                new FileOutputStream(allStringsFile), java.nio.charset.StandardCharsets.UTF_8))) {
+        try (PrintWriter out = openWriter(allStringsFile)) {
             for (DumpEntry e : sorted) out.println(escapeLog(e.value));
         }
 
@@ -241,8 +238,7 @@ public class ENI_StringDumper {
         }
 
         File errorFile = new File(outDir, "errors.log");
-        try (PrintWriter out = new PrintWriter(new OutputStreamWriter(
-                new FileOutputStream(errorFile), java.nio.charset.StandardCharsets.UTF_8))) {
+        try (PrintWriter out = openWriter(errorFile)) {
             out.println("# Error summary (" + errorList.size() + " total)");
             errorTypes.entrySet().stream()
                     .sorted(Map.Entry.<String, Integer>comparingByValue().reversed())
@@ -252,8 +248,7 @@ public class ENI_StringDumper {
         }
 
         File summaryFile = new File(outDir, "summary.txt");
-        try (PrintWriter out = new PrintWriter(new OutputStreamWriter(
-                new FileOutputStream(summaryFile), java.nio.charset.StandardCharsets.UTF_8))) {
+        try (PrintWriter out = openWriter(summaryFile)) {
             out.println("Target  : " + jarFile.getAbsolutePath());
             out.println("Date    : " + new java.util.Date());
             out.println();
@@ -438,16 +433,16 @@ public class ENI_StringDumper {
             int len = Array.getLength(obj);
             for (int i = 0; i < len; i++)
                 collectFromObject(Array.get(obj, i), className, fieldName,
-                        prefix + "[" + i + "]", results, seenLines, depth + 1, visited);
+                        prefix + '[' + i + ']', results, seenLines, depth + 1, visited);
             return;
         }
         if (obj instanceof Map<?, ?>) {
             for (Map.Entry<?, ?> entry : ((Map<?, ?>) obj).entrySet()) {
                 String k = entry.getKey() != null ? entry.getKey().toString() : "null";
                 collectFromObject(entry.getKey(), className, fieldName,
-                        prefix + "[key:" + k + "]", results, seenLines, depth + 1, visited);
+                        prefix + "[key:" + k + ']', results, seenLines, depth + 1, visited);
                 collectFromObject(entry.getValue(), className, fieldName,
-                        prefix + "[" + k + "]", results, seenLines, depth + 1, visited);
+                        prefix + '[' + k + ']', results, seenLines, depth + 1, visited);
             }
             return;
         }
@@ -455,7 +450,7 @@ public class ENI_StringDumper {
             int i = 0;
             for (Object item : (Iterable<?>) obj)
                 collectFromObject(item, className, fieldName,
-                        prefix + "[" + i++ + "]", results, seenLines, depth + 1, visited);
+                        prefix + '[' + i++ + ']', results, seenLines, depth + 1, visited);
             return;
         }
         if (depth < MAX_DEPTH - 1) {
@@ -463,7 +458,7 @@ public class ENI_StringDumper {
                 if (Modifier.isStatic(f.getModifiers())) continue;
                 try {
                     collectFromObject(f.get(obj), className, fieldName,
-                            prefix + "." + f.getName(), results, seenLines, depth + 1, visited);
+                            prefix + '.' + f.getName(), results, seenLines, depth + 1, visited);
                 } catch (Throwable ignored) {}
             }
         }
@@ -479,6 +474,8 @@ public class ENI_StringDumper {
                                       Map<String, Set<String>> deps,
                                       Map<String, StubInfo> stubNeeds) {
         final Set<String> internal = new HashSet<>(classBytes.keySet());
+        final Set<String> internalSlash = new HashSet<>(internal.size());
+        for (String n : internal) internalSlash.add(n.replace('.', '/'));
 
         for (Map.Entry<String, byte[]> entry : classBytes.entrySet()) {
             final String name = entry.getKey();
@@ -496,16 +493,19 @@ public class ENI_StringDumper {
                         if (!DO_STUBS) return;
                         if (interfaces != null) {
                             for (String iface : interfaces) {
-                                String ifaceDot = iface.replace('/', '.');
-                                if (!internal.contains(ifaceDot) && !isJdkClass(ifaceDot)) {
-                                    StubInfo info = stubNeeds.computeIfAbsent(ifaceDot, k -> new StubInfo(k, true));
-                                    info.isInterface = true;
+                                if (!internalSlash.contains(iface)) {
+                                    String ifaceDot = iface.replace('/', '.');
+                                    if (!isJdkClass(ifaceDot)) {
+                                        StubInfo info = stubNeeds.computeIfAbsent(ifaceDot, k -> new StubInfo(k, true));
+                                        info.isInterface = true;
+                                    }
                                 }
                             }
                         }
-                        if (superName != null && !superName.equals("java/lang/Object")) {
+                        if (superName != null && !superName.equals("java/lang/Object")
+                                && !internalSlash.contains(superName)) {
                             String superDot = superName.replace('/', '.');
-                            if (!internal.contains(superDot) && !isJdkClass(superDot))
+                            if (!isJdkClass(superDot))
                                 stubNeeds.computeIfAbsent(superDot, k -> new StubInfo(k, false));
                         }
                     }
@@ -517,11 +517,12 @@ public class ENI_StringDumper {
                         return new MethodVisitor(Opcodes.ASM9) {
                             @Override
                             public void visitFieldInsn(int opcode, String owner, String fname, String fdesc) {
-                                String ownerDot = owner.replace('/', '.');
-                                if (internal.contains(ownerDot) && !ownerDot.equals(name)) {
-                                    if (opcode == Opcodes.GETSTATIC) myDeps.add(ownerDot);
-                                } else if (DO_STUBS && !internal.contains(ownerDot) && !isJdkClass(ownerDot)) {
-                                    stubNeeds.computeIfAbsent(ownerDot, k -> new StubInfo(k, false));
+                                if (internalSlash.contains(owner) && !owner.equals(name.replace('.', '/'))) {
+                                    if (opcode == Opcodes.GETSTATIC) myDeps.add(owner.replace('/', '.'));
+                                } else if (DO_STUBS && !internalSlash.contains(owner)) {
+                                    String ownerDot = owner.replace('/', '.');
+                                    if (!isJdkClass(ownerDot))
+                                        stubNeeds.computeIfAbsent(ownerDot, k -> new StubInfo(k, false));
                                 }
                             }
 
@@ -534,9 +535,9 @@ public class ENI_StringDumper {
                                         || (owner.equals("java/lang/Thread") && mname2.equals("getStackTrace")))
                                     hasTimingCall[0] = true;
 
-                                if (!DO_STUBS) return;
+                                if (!DO_STUBS || internalSlash.contains(owner)) return;
                                 String ownerDot = owner.replace('/', '.');
-                                if (internal.contains(ownerDot) || isJdkClass(ownerDot)) return;
+                                if (isJdkClass(ownerDot)) return;
                                 boolean iface = isInterface || opcode == Opcodes.INVOKEINTERFACE;
                                 StubInfo info = stubNeeds.computeIfAbsent(ownerDot, k -> new StubInfo(k, iface));
                                 if (iface) info.isInterface = true;
@@ -554,20 +555,20 @@ public class ENI_StringDumper {
     }
 
     static List<String> topologicalSort(Set<String> nodes, Map<String, Set<String>> deps) {
-        Map<String, Integer>    inDegree = new HashMap<>();
-        Map<String, Set<String>> revDeps = new HashMap<>();
-        for (String n : nodes) { inDegree.put(n, 0); revDeps.put(n, new HashSet<>()); }
+        Map<String, Integer>    inDegree = new HashMap<>(nodes.size());
+        Map<String, Set<String>> revDeps = new HashMap<>(nodes.size());
+        for (String n : nodes) inDegree.put(n, 0);
 
         for (Map.Entry<String, Set<String>> e : deps.entrySet()) {
             String a = e.getKey();
             for (String b : e.getValue()) {
                 if (!nodes.contains(b)) continue;
-                revDeps.get(b).add(a);
+                revDeps.computeIfAbsent(b, k -> new HashSet<>()).add(a);
                 inDegree.merge(a, 1, Integer::sum);
             }
         }
 
-        Queue<String> queue = new LinkedList<>();
+        Queue<String> queue = new ArrayDeque<>();
         for (Map.Entry<String, Integer> e : inDegree.entrySet())
             if (e.getValue() == 0) queue.add(e.getKey());
 
@@ -595,10 +596,14 @@ public class ENI_StringDumper {
     }
 
     static boolean isJdkClass(String name) {
-        return name.startsWith("java.") || name.startsWith("javax.")
-                || name.startsWith("sun.") || name.startsWith("com.sun.")
-                || name.startsWith("jdk.") || name.startsWith("org.xml.")
-                || name.startsWith("org.w3c.");
+        if (name.isEmpty()) return false;
+        switch (name.charAt(0)) {
+            case 'j': return name.startsWith("java.") || name.startsWith("javax.") || name.startsWith("jdk.");
+            case 's': return name.startsWith("sun.");
+            case 'c': return name.startsWith("com.sun.");
+            case 'o': return name.startsWith("org.xml.") || name.startsWith("org.w3c.");
+            default:  return false;
+        }
     }
 
     static void emitZeroReturn(MethodVisitor mv, String ret, String descriptor, int opcode) {
@@ -1054,6 +1059,11 @@ public class ENI_StringDumper {
         Process p = new ProcessBuilder(cmd).inheritIO().start();
         p.waitFor();
         System.exit(p.exitValue());
+    }
+
+    static PrintWriter openWriter(File f) throws IOException {
+        return new PrintWriter(new OutputStreamWriter(
+                new FileOutputStream(f), java.nio.charset.StandardCharsets.UTF_8));
     }
 
     static byte[] readAllBytes(InputStream is) throws IOException {
