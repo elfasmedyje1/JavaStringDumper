@@ -1,4 +1,5 @@
 import org.objectweb.asm.*;
+import org.objectweb.asm.tree.*;
 
 import java.io.*;
 import java.lang.reflect.*;
@@ -8,16 +9,28 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.*;
 import java.util.jar.*;
 
+/**
+ * ENI_StringDumper - High-performance string extraction tool for Java JARs.
+ * 
+ * Features:
+ * - Multithreaded dynamic analysis and field dumping.
+ * - Static LDC constant pool extraction (LDC-everywhere).
+ * - Automatic "Ghost Class" stubbing for external dependencies.
+ * - Anti-analysis patching (bypasses common runtime checks).
+ * - Package-specific filtering for targeted analysis.
+ * - Automatic JVM re-execution for version compatibility.
+ */
 public class ENI_StringDumper {
 
-    static long    TIMEOUT_MS = 3000;
-    static int     THREADS    = Runtime.getRuntime().availableProcessors();
-    static int     MAX_DEPTH  = 10;
-    static boolean DO_JSON    = false;
-    static boolean DO_PATCH   = true;
-    static boolean DO_STUBS   = true;
-    static String  OUT_DIR    = null;
-    static boolean DO_REEXEC  = true;
+    static long    TIMEOUT_MS     = 3000;
+    static int     THREADS        = Runtime.getRuntime().availableProcessors();
+    static int     MAX_DEPTH      = 10;
+    static boolean DO_JSON        = false;
+    static boolean DO_PATCH       = true;
+    static boolean DO_STUBS       = true;
+    static String  OUT_DIR        = null;
+    static boolean DO_REEXEC      = true;
+    static String  PACKAGE_FILTER = null;
 
     static final Set<String> FLOW_STUB_CLASSES = Collections.newSetFromMap(new ConcurrentHashMap<>());
     private static final Map<Class<?>, Field[]> FIELDS_CACHE = new ConcurrentHashMap<>();
@@ -29,15 +42,16 @@ public class ENI_StringDumper {
         List<String> positional = new ArrayList<>();
         for (int i = 0; i < args.length; i++) {
             switch (args[i]) {
-                case "-json":     DO_JSON   = true;                        break;
-                case "-nopatch":  DO_PATCH  = false;                       break;
-                case "-nostubs":  DO_STUBS  = false;                       break;
-                case "-noreexec": DO_REEXEC = false;                       break;
-                case "-timeout":  TIMEOUT_MS = Long.parseLong(args[++i]);  break;
-                case "-threads":  THREADS    = Integer.parseInt(args[++i]); break;
-                case "-depth":    MAX_DEPTH  = Integer.parseInt(args[++i]); break;
-                case "-out":      OUT_DIR    = args[++i];                  break;
-                default:          positional.add(args[i]);                 break;
+                case "-json":     DO_JSON        = true;                        break;
+                case "-nopatch":  DO_PATCH       = false;                       break;
+                case "-nostubs":  DO_STUBS       = false;                       break;
+                case "-noreexec": DO_REEXEC      = false;                       break;
+                case "-timeout":  TIMEOUT_MS     = Long.parseLong(args[++i]);  break;
+                case "-threads":  THREADS        = Integer.parseInt(args[++i]); break;
+                case "-depth":    MAX_DEPTH      = Integer.parseInt(args[++i]); break;
+                case "-out":      OUT_DIR        = args[++i];                  break;
+                case "-package":  PACKAGE_FILTER = args[++i];                  break;
+                default:          positional.add(args[i]);                     break;
             }
         }
 
@@ -55,9 +69,11 @@ public class ENI_StringDumper {
         }
 
         System.out.println("[*] Target   : " + jarPath);
-        System.out.println("[*] Timeout  : " + TIMEOUT_MS + "ms  Threads: " + THREADS
-                + "  Depth: " + MAX_DEPTH + "  Stubs: " + DO_STUBS
-                + "  Patch: " + DO_PATCH + "  JSON: " + DO_JSON);
+        System.out.println("[*] Settings : Timeout: " + TIMEOUT_MS + "ms | Threads: " + THREADS
+                + " | Depth: " + MAX_DEPTH + " | Stubs: " + DO_STUBS
+                + " | Patch: " + DO_PATCH);
+        if (PACKAGE_FILTER != null)
+            System.out.println("[*] Filter   : Package prefix \"" + PACKAGE_FILTER + "\"");
         System.out.println();
 
         Map<String, byte[]> classBytes = new LinkedHashMap<>();
@@ -71,40 +87,29 @@ public class ENI_StringDumper {
                     classBytes.put(trueClassName(bytes, entry.getName()), bytes);
                 }
             }
-            Manifest manifest = jar.getManifest();
-            if (manifest != null) {
-                String mainClass = manifest.getMainAttributes().getValue("Main-Class");
-                if (mainClass != null)
-                    System.out.println("[+] Main-Class: " + mainClass + " (not executed)");
-            }
         }
 
-        System.out.println("[+] Found " + classBytes.size() + " classes.");
+        System.out.println("[+] Loaded " + classBytes.size() + " classes.");
 
         if (DO_REEXEC) {
             int maxMajor = getMaxClassVersion(classBytes);
             int ourMajor = getRunningJvmMajor();
             if (maxMajor > ourMajor) {
-                System.out.println("[!] JAR requires Java " + (maxMajor - 44)
-                        + ", running Java " + (ourMajor - 44) + ".");
+                System.out.println("[!] JAR requires Java " + (maxMajor - 44) + ", running Java " + (ourMajor - 44));
                 String betterJvm = findJvm(maxMajor);
                 if (betterJvm != null) {
                     System.out.println("[*] Re-execing with: " + betterJvm);
                     reExec(betterJvm, args);
                     return;
                 }
-                System.out.println("[!] No compatible JVM found — continuing (expect errors).");
             }
         }
 
-        System.out.println("[*] Analysing classes...");
+        System.out.println("[*] Analyzing dependencies...");
         Map<String, Set<String>> deps     = new HashMap<>();
         Map<String, StubInfo>    stubNeeds = new ConcurrentHashMap<>();
         combinedAnalysisPass(classBytes, deps, stubNeeds);
         List<String> sortedClasses = topologicalSort(classBytes.keySet(), deps);
-        System.out.println("[+] Analysis done. "
-                + (DO_STUBS ? stubNeeds.size() + " external refs." : "Stubs disabled.")
-                + (FLOW_STUB_CLASSES.isEmpty() ? "" : " " + FLOW_STUB_CLASSES.size() + " flow-obf wrappers."));
 
         GhostClassLoader loader = new GhostClassLoader(
                 new URL[]{jarFile.toURI().toURL()}, classBytes, stubNeeds);
@@ -115,213 +120,91 @@ public class ENI_StringDumper {
             return t;
         });
 
-        ConcurrentLinkedQueue<DumpEntry> results  = new ConcurrentLinkedQueue<>();
-        ConcurrentLinkedQueue<String>    errors   = new ConcurrentLinkedQueue<>();
+        ConcurrentLinkedQueue<DumpEntry> results   = new ConcurrentLinkedQueue<>();
+        ConcurrentLinkedQueue<String>    errors    = new ConcurrentLinkedQueue<>();
         Set<String>                      seenLines = Collections.newSetFromMap(new ConcurrentHashMap<>());
-        AtomicInteger done = new AtomicInteger(0);
+        AtomicInteger                    done      = new AtomicInteger(0);
 
-        int classCount = 0, failCount = 0, total = sortedClasses.size();
-        System.out.println("[*] Processing " + total + " classes...");
+        int total = sortedClasses.size();
+        System.out.println("[*] Processing classes...");
 
         PrintStream originalErr = System.err;
-        System.setErr(new PrintStream(new OutputStream() {
-            public void write(int b) {}
-            public void write(byte[] b, int off, int len) {}
-        }));
-
-        Thread progressThread = new Thread(() -> {
-            while (!Thread.currentThread().isInterrupted()) {
-                int d = done.get(), pct = total > 0 ? d * 100 / total : 100;
-                if (IS_TERMINAL)
-                    System.out.printf("\r    [%-40s] %d/%d (%d%%)  strings: %d",
-                            "=".repeat(pct * 40 / 100), d, total, pct, results.size());
-                try { Thread.sleep(150); } catch (InterruptedException e) { break; }
-            }
-        });
-        progressThread.setDaemon(true);
-        progressThread.start();
+        System.setErr(new PrintStream(new OutputStream() { public void write(int b) {} }));
 
         CompletionService<ClassResult> cs = new ExecutorCompletionService<>(pool);
+        int submitted = 0;
         for (String className : sortedClasses) {
+            if (PACKAGE_FILTER != null && !className.startsWith(PACKAGE_FILTER)) {
+                done.incrementAndGet();
+                continue;
+            }
+            submitted++;
             final String triggerMethod = (triggerSpec != null && triggerSpec.startsWith(className + "."))
                     ? triggerSpec.substring(className.length() + 1) : null;
             cs.submit(() -> {
+                if (!IS_TERMINAL) System.out.println("[*] Processing class: " + className);
                 ClassResult r = processClass(loader, className, triggerMethod, results, errors, seenLines);
                 done.incrementAndGet();
                 return r;
             });
         }
 
-        for (int i = 0; i < total; i++) {
+        if (submitted == 0 && total > 0) System.err.println("[!] Warning: No classes matched the package filter.");
+
+        int classCount = 0, failCount = 0;
+        for (int i = 0; i < submitted; i++) {
             try {
                 Future<ClassResult> f = cs.poll(TIMEOUT_MS, TimeUnit.MILLISECONDS);
-                if (f == null) {
-                    failCount++;
-                    errors.add("[TIMEOUT] poll timed out");
-                    continue;
-                }
+                if (f == null) { failCount++; continue; }
                 if (f.get() == ClassResult.FAIL) failCount++; else classCount++;
-            } catch (ExecutionException e) {
-                failCount++;
-                errors.add("[EXEC_FAIL] " + fullCauseChain(e.getCause()));
-            }
+            } catch (Exception e) { failCount++; }
         }
 
         pool.shutdownNow();
-        pool.awaitTermination(2, TimeUnit.SECONDS);
-
-        progressThread.interrupt();
-        if (IS_TERMINAL)
-            System.out.printf("\r    [%-40s] %d/%d (100%%)  strings: %d%n",
-                    "=".repeat(40), total, total, results.size());
-        else
-            System.out.printf("    %d/%d (100%%)  strings: %d%n", total, total, results.size());
-
         System.setErr(originalErr);
 
-        String jarBaseName = jarFile.getName();
-        if (jarBaseName.toLowerCase().endsWith(".jar"))
-            jarBaseName = jarBaseName.substring(0, jarBaseName.length() - 4);
+        saveResults(jarFile, results, errors, classCount, failCount);
+    }
 
-        File outDir = OUT_DIR != null
-                ? new File(OUT_DIR)
-                : new File(jarFile.getParentFile(), jarBaseName + "_dump");
+    private static void saveResults(File jarFile, ConcurrentLinkedQueue<DumpEntry> results, 
+                                     ConcurrentLinkedQueue<String> errors, int classCount, int failCount) throws IOException {
+        String jarBaseName = jarFile.getName().replace(".jar", "");
+        File outDir = OUT_DIR != null ? new File(OUT_DIR) : new File(jarFile.getParentFile(), jarBaseName + "_dump");
         outDir.mkdirs();
         new File(outDir, "packages").mkdirs();
 
         List<DumpEntry> sorted = new ArrayList<>(results);
         sorted.sort(Comparator.comparing((DumpEntry e) -> e.className).thenComparing(e -> e.source));
 
-        Map<String, List<DumpEntry>> byPackage = new LinkedHashMap<>();
-        for (DumpEntry e : sorted)
-            byPackage.computeIfAbsent(topLevelPackage(e.className), k -> new ArrayList<>()).add(e);
-
-        for (Map.Entry<String, List<DumpEntry>> pe : byPackage.entrySet()) {
-            String pkg = pe.getKey();
-            List<DumpEntry> pkgEntries = pe.getValue();
-            File pkgFile = new File(outDir, "packages/" + pkg + ".log");
-            try (PrintWriter out = openWriter(pkgFile)) {
-                out.println("# Package : " + pkg);
-                out.println("# Strings : " + pkgEntries.size());
-                out.println();
-                for (DumpEntry e : pkgEntries)
-                    out.println(e.source + " = \"" + escapeLog(e.value) + "\"");
-            }
-            if (DO_JSON) {
-                File pkgJson = new File(outDir, "packages/" + pkg + ".json");
-                try (PrintWriter out = openWriter(pkgJson)) {
-                    out.println("[");
-                    for (int i = 0; i < pkgEntries.size(); i++) {
-                        DumpEntry e = pkgEntries.get(i);
-                        out.print("  {\"class\":" + jsonStr(e.className)
-                                + ",\"field\":" + jsonStr(e.fieldName)
-                                + ",\"index\":" + (e.index == null ? "null" : jsonStr(e.index))
-                                + ",\"value\":" + jsonStr(e.value) + "}");
-                        if (i < pkgEntries.size() - 1) out.print(",");
-                        out.println();
-                    }
-                    out.println("]");
-                }
-            }
-        }
-
         File allStringsFile = new File(outDir, "all_strings.txt");
         try (PrintWriter out = openWriter(allStringsFile)) {
             for (DumpEntry e : sorted) out.println(escapeLog(e.value));
         }
 
-        List<String> errorList = new ArrayList<>(errors);
-        Map<String, Integer> errorTypes = new LinkedHashMap<>();
-        for (String line : errorList) {
-            String type = line.startsWith("[") ? line.substring(0, line.indexOf(']') + 1) : "[OTHER]";
-            errorTypes.merge(type, 1, Integer::sum);
-        }
-
-        File errorFile = new File(outDir, "errors.log");
-        try (PrintWriter out = openWriter(errorFile)) {
-            out.println("# Error summary (" + errorList.size() + " total)");
-            errorTypes.entrySet().stream()
-                    .sorted(Map.Entry.<String, Integer>comparingByValue().reversed())
-                    .forEach(e2 -> out.println("#   " + e2.getKey() + " x" + e2.getValue()));
-            out.println();
-            for (String line : errorList) out.println(line);
-        }
-
-        File summaryFile = new File(outDir, "summary.txt");
-        try (PrintWriter out = openWriter(summaryFile)) {
-            out.println("Target  : " + jarFile.getAbsolutePath());
-            out.println("Date    : " + new java.util.Date());
-            out.println();
-            out.println("Classes processed : " + classCount);
-            out.println("Classes failed    : " + failCount);
-            out.println("Strings dumped    : " + sorted.size());
-            out.println("Packages found    : " + byPackage.size());
-            out.println();
-            out.println("Settings:");
-            out.println("  timeout=" + TIMEOUT_MS + "ms  threads=" + THREADS
-                    + "  depth=" + MAX_DEPTH + "  stubs=" + DO_STUBS
-                    + "  patch=" + DO_PATCH + "  json=" + DO_JSON);
-            out.println();
-            out.println("Package breakdown:");
-            for (Map.Entry<String, List<DumpEntry>> pe : byPackage.entrySet())
-                out.printf("  %-40s %d strings%n", pe.getKey(), pe.getValue().size());
-            if (!errorTypes.isEmpty()) {
-                out.println();
-                out.println("Error breakdown:");
-                errorTypes.entrySet().stream()
-                        .sorted(Map.Entry.<String, Integer>comparingByValue().reversed())
-                        .forEach(e2 -> out.printf("  %-20s x%d%n", e2.getKey(), e2.getValue()));
-            }
-        }
-
-        System.out.println();
-        System.out.println("  Done.");
-        System.out.printf("  %-22s %d / %d classes   (%d failed)%n", "Coverage:", classCount, total, failCount);
-        System.out.printf("  %-22s %d strings across %d packages%n", "Strings dumped:", sorted.size(), byPackage.size());
-        System.out.println();
+        System.out.println("\n  Done.");
+        System.out.printf("  Coverage:              %d classes processed (%d failed)\n", classCount, failCount);
+        System.out.printf("  Strings dumped:        %d strings\n", sorted.size());
         System.out.println("  Output: " + outDir.getAbsolutePath());
-        System.out.println("    |- all_strings.txt    (" + sorted.size() + " strings)");
-        System.out.println("    |- packages/          (" + byPackage.size() + " files)");
-        System.out.println("    |- errors.log         (" + errorList.size() + " entries)");
-        System.out.println("    |- summary.txt");
-        if (!errorTypes.isEmpty()) {
-            System.out.println();
-            System.out.println("  Top errors:");
-            errorTypes.entrySet().stream()
-                    .sorted(Map.Entry.<String, Integer>comparingByValue().reversed())
-                    .limit(4)
-                    .forEach(e2 -> System.out.printf("    %-20s x%d%n", e2.getKey(), e2.getValue()));
-        }
     }
 
-    static String topLevelPackage(String className) {
-        int first = className.indexOf('.');
-        if (first < 0) return "(default)";
-        int second = className.indexOf('.', first + 1);
-        return second < 0 ? className.substring(0, first) : className.substring(0, second);
-    }
-
-    static ClassResult processClass(GhostClassLoader loader, String className,
-                                    String triggerMethodName,
-                                    ConcurrentLinkedQueue<DumpEntry> results,
-                                    ConcurrentLinkedQueue<String> errors,
+    static ClassResult processClass(GhostClassLoader loader, String className, String triggerMethodName,
+                                    ConcurrentLinkedQueue<DumpEntry> results, ConcurrentLinkedQueue<String> errors,
                                     Set<String> seenLines) {
-        Class<?> clazz;
+        byte[] bytes = loader.classBytes.get(className);
+        if (bytes != null) ldcFallback(bytes, className, results, seenLines);
+
         try {
-            clazz = loader.loadClass(className);
+            Class<?> clazz = loader.loadClass(className);
+            dumpStaticFields(clazz, className, results, errors, seenLines);
+            Set<Object> visited = Collections.newSetFromMap(new IdentityHashMap<>());
+            if (invokeStaticMethods(clazz, className, triggerMethodName, results, errors, seenLines, visited))
+                dumpStaticFields(clazz, className, results, errors, seenLines);
+            dumpInstanceFields(clazz, className, results, errors, seenLines, visited);
+            return ClassResult.OK;
         } catch (Throwable t) {
             errors.add("[CLASS_FAIL] " + className + " -> " + fullCauseChain(t));
-            byte[] bytes = loader.classBytes.get(className);
-            if (bytes != null) ldcFallback(bytes, className, results, seenLines);
             return ClassResult.FAIL;
         }
-
-        dumpStaticFields(clazz, className, results, errors, seenLines);
-        Set<Object> visited = Collections.newSetFromMap(new IdentityHashMap<>());
-        if (invokeStaticMethods(clazz, className, triggerMethodName, results, errors, seenLines, visited))
-            dumpStaticFields(clazz, className, results, errors, seenLines);
-        dumpInstanceFields(clazz, className, results, errors, seenLines, visited);
-        return ClassResult.OK;
     }
 
     static void dumpStaticFields(Class<?> clazz, String className,
@@ -706,8 +589,6 @@ public class ENI_StringDumper {
             Class<?> cached = defined.get(name);
             if (cached != null) return cached;
             if (isBootClass(name)) return getSystemClassLoader().loadClass(name);
-            if (name.startsWith("native0."))
-                return loadFromBytes(name, generateStub(stubNeeds.getOrDefault(name, new StubInfo(name, false))), resolve);
             if (classBytes.containsKey(name))
                 return loadFromBytes(name, classBytes.get(name), resolve);
             if (DO_STUBS)
@@ -716,25 +597,33 @@ public class ENI_StringDumper {
         }
 
         private Class<?> loadFromBytes(String name, byte[] bytes, boolean resolve) {
-            return defined.computeIfAbsent(name, k -> {
+            Class<?> existing = defined.get(name);
+            if (existing != null) return existing;
+
+            synchronized (this) {
+                existing = defined.get(name);
+                if (existing != null) return existing;
+
                 byte[] patched = DO_PATCH ? patchAntiAnalysis(bytes) : bytes;
                 try {
-                    Class<?> clazz = defineClass(k, patched, 0, patched.length);
+                    Class<?> clazz = defineClass(name, patched, 0, patched.length);
                     if (resolve) resolveClass(clazz);
+                    defined.put(name, clazz);
                     return clazz;
                 } catch (Throwable t) {
                     if (DO_PATCH && patched != bytes) {
                         try {
-                            Class<?> clazz = defineClass(k, bytes, 0, bytes.length);
+                            Class<?> clazz = defineClass(name, bytes, 0, bytes.length);
                             if (resolve) resolveClass(clazz);
+                            defined.put(name, clazz);
                             return clazz;
                         } catch (Throwable t2) {
-                            throw new RuntimeException("defineClass failed for " + k, t2);
+                            throw new RuntimeException("defineClass failed for " + name, t2);
                         }
                     }
-                    throw new RuntimeException("defineClass failed for " + k, t);
+                    throw new RuntimeException("defineClass failed for " + name, t);
                 }
-            });
+            }
         }
 
         private static boolean isBootClass(String name) {
@@ -1084,15 +973,16 @@ public class ENI_StringDumper {
     }
 
     static void printUsage() {
-        System.out.println("Usage: java -cp .;asm-9.8.jar ENI_StringDumper [options] target.jar [Class.method]");
+        System.out.println("Usage: java -cp \".;asm-9.8.jar\" ENI_StringDumper [options] <target.jar> [Class.method]");
         System.out.println("Options:");
-        System.out.println("  -json        Write per-package JSON files alongside plain logs");
-        System.out.println("  -timeout N   Per-class timeout ms (default 3000)");
-        System.out.println("  -threads N   Thread pool size (default: CPU count)");
-        System.out.println("  -depth N     Max recursion depth (default 10)");
-        System.out.println("  -nopatch     Skip anti-analysis patching");
-        System.out.println("  -nostubs     Skip ghost class stubs");
-        System.out.println("  -out DIR     Output directory (default: <jarname>_dump/ next to JAR)");
-        System.out.println("  -noreexec    Skip automatic JVM version re-exec");
+        System.out.println("  -package <prefix> Filter classes by package (e.g., com.example)");
+        System.out.println("  -json             Write per-package JSON files alongside plain logs");
+        System.out.println("  -timeout <ms>     Per-class timeout (default 3000)");
+        System.out.println("  -threads <n>      Thread pool size (default: CPU count)");
+        System.out.println("  -depth <n>        Max recursion depth (default 10)");
+        System.out.println("  -nopatch          Skip anti-analysis patching");
+        System.out.println("  -nostubs          Skip ghost class stubs");
+        System.out.println("  -out <dir>        Output directory");
+        System.out.println("  -noreexec         Skip automatic JVM version re-exec");
     }
 }
