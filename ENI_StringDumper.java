@@ -1,5 +1,4 @@
 import org.objectweb.asm.*;
-import org.objectweb.asm.tree.*;
 
 import java.io.*;
 import java.lang.reflect.*;
