@@ -175,14 +175,67 @@ public class ENI_StringDumper {
         List<DumpEntry> sorted = new ArrayList<>(results);
         sorted.sort(Comparator.comparing((DumpEntry e) -> e.className).thenComparing(e -> e.source));
 
+        Map<String, List<DumpEntry>> byPackage = new LinkedHashMap<>();
+        for (DumpEntry e : sorted)
+            byPackage.computeIfAbsent(topLevelPackage(e.className), k -> new ArrayList<>()).add(e);
+
+        for (Map.Entry<String, List<DumpEntry>> pe : byPackage.entrySet()) {
+            String pkg = pe.getKey();
+            List<DumpEntry> pkgEntries = pe.getValue();
+            File pkgFile = new File(outDir, "packages/" + pkg + ".log");
+            try (PrintWriter out = openWriter(pkgFile)) {
+                out.println("# Package : " + pkg);
+                out.println("# Strings : " + pkgEntries.size());
+                out.println();
+                for (DumpEntry e : pkgEntries)
+                    out.println(e.source + " = \"" + escapeLog(e.value) + "\"");
+            }
+        }
+
         File allStringsFile = new File(outDir, "all_strings.txt");
         try (PrintWriter out = openWriter(allStringsFile)) {
             for (DumpEntry e : sorted) out.println(escapeLog(e.value));
         }
 
+        List<String> errorList = new ArrayList<>(errors);
+        Map<String, Integer> errorTypes = new LinkedHashMap<>();
+        for (String line : errorList) {
+            String type = line.startsWith("[") ? line.substring(0, line.indexOf(']') + 1) : "[OTHER]";
+            errorTypes.merge(type, 1, Integer::sum);
+        }
+
+        File errorFile = new File(outDir, "errors.log");
+        try (PrintWriter out = openWriter(errorFile)) {
+            out.println("# Error summary (" + errorList.size() + " total)");
+            errorTypes.entrySet().stream()
+                    .sorted(Map.Entry.<String, Integer>comparingByValue().reversed())
+                    .forEach(e2 -> out.println("#   " + e2.getKey() + " x" + e2.getValue()));
+            out.println();
+            for (String line : errorList) out.println(line);
+        }
+
+        File summaryFile = new File(outDir, "summary.txt");
+        try (PrintWriter out = openWriter(summaryFile)) {
+            out.println("Target  : " + jarFile.getAbsolutePath());
+            out.println("Date    : " + new java.util.Date());
+            out.println();
+            out.println("Classes processed : " + classCount);
+            out.println("Classes failed    : " + failCount);
+            out.println("Strings dumped    : " + sorted.size());
+            out.println("Packages found    : " + byPackage.size());
+            out.println();
+            out.println("Settings:");
+            out.println("  timeout=" + TIMEOUT_MS + "ms | threads=" + THREADS + " | depth=" + MAX_DEPTH);
+            if (PACKAGE_FILTER != null) out.println("  filter=" + PACKAGE_FILTER);
+            out.println();
+            out.println("Package breakdown:");
+            for (Map.Entry<String, List<DumpEntry>> pe : byPackage.entrySet())
+                out.printf("  %-40s %d strings\n", pe.getKey(), pe.getValue().size());
+        }
+
         System.out.println("\n  Done.");
         System.out.printf("  Coverage:              %d classes processed (%d failed)\n", classCount, failCount);
-        System.out.printf("  Strings dumped:        %d strings\n", sorted.size());
+        System.out.printf("  Strings dumped:        %d strings across %d packages\n", sorted.size(), byPackage.size());
         System.out.println("  Output: " + outDir.getAbsolutePath());
     }
 
@@ -969,6 +1022,13 @@ public class ENI_StringDumper {
             String raw = entryPath.replace('/', '.');
             return raw.substring(0, raw.length() - 6);
         }
+    }
+
+    static String topLevelPackage(String className) {
+        int first = className.indexOf('.');
+        if (first < 0) return "(default)";
+        int second = className.indexOf('.', first + 1);
+        return second < 0 ? className.substring(0, first) : className.substring(0, second);
     }
 
     static void printUsage() {
