@@ -38,6 +38,9 @@ On Linux/macOS use `:` instead of `;` in the classpath.
 | Flag | Description |
 |------|-------------|
 | `-json` | Write per-package `.json` files alongside plain `.log` files |
+| `-package P` | Filter classes by package prefix (e.g. `com.example`) |
+| `-libs JAR` | Add library JAR to classpath for better dependency resolution (repeatable) |
+| `-brutemax N`| Max index for brute-forcing parameterized decryptors (default: `512`) |
 | `-timeout N` | Per-class processing timeout in ms (default: `3000`) |
 | `-threads N` | Worker thread count (default: CPU core count) |
 | `-depth N` | Max object graph recursion depth (default: `10`) |

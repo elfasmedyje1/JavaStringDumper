@@ -30,6 +30,9 @@ public class ENI_StringDumper {
     static String  OUT_DIR        = null;
     static boolean DO_REEXEC      = true;
     static String  PACKAGE_FILTER = null;
+    static List<String> LIBS      = new ArrayList<>();
+    // Max index to brute-force for single-int-arg decryptors
+    static int     BRUTE_MAX      = 512;
 
     static final Set<String> FLOW_STUB_CLASSES = Collections.newSetFromMap(new ConcurrentHashMap<>());
     private static final Map<Class<?>, Field[]> FIELDS_CACHE = new ConcurrentHashMap<>();
@@ -50,6 +53,8 @@ public class ENI_StringDumper {
                 case "-depth":    MAX_DEPTH      = Integer.parseInt(args[++i]); break;
                 case "-out":      OUT_DIR        = args[++i];                  break;
                 case "-package":  PACKAGE_FILTER = args[++i];                  break;
+                case "-libs":     LIBS.add(args[++i]);                         break;
+                case "-brutemax": BRUTE_MAX      = Integer.parseInt(args[++i]); break;
                 default:          positional.add(args[i]);                     break;
             }
         }
@@ -73,6 +78,8 @@ public class ENI_StringDumper {
                 + " | Patch: " + DO_PATCH);
         if (PACKAGE_FILTER != null)
             System.out.println("[*] Filter   : Package prefix \"" + PACKAGE_FILTER + "\"");
+        if (!LIBS.isEmpty())
+            System.out.println("[*] Libs     : " + LIBS);
         System.out.println();
 
         Map<String, byte[]> classBytes = new LinkedHashMap<>();
@@ -110,8 +117,21 @@ public class ENI_StringDumper {
         combinedAnalysisPass(classBytes, deps, stubNeeds);
         List<String> sortedClasses = topologicalSort(classBytes.keySet(), deps);
 
+        // Build loader URL list: target JAR first, then any -libs JARs.
+        List<URL> loaderUrls = new ArrayList<>();
+        loaderUrls.add(jarFile.toURI().toURL());
+        for (String lib : LIBS) {
+            File libFile = new File(lib).getAbsoluteFile();
+            if (libFile.exists()) loaderUrls.add(libFile.toURI().toURL());
+            else System.err.println("[!] Lib not found: " + lib);
+        }
+
+        // poisonedClasses: classes whose <clinit> failed; dependents that GETSTATIC
+        // from them would cascade-fail. We patch those GETSTATICs out in the loader.
+        Set<String> poisonedClasses = Collections.newSetFromMap(new ConcurrentHashMap<>());
+
         GhostClassLoader loader = new GhostClassLoader(
-                new URL[]{jarFile.toURI().toURL()}, classBytes, stubNeeds);
+                loaderUrls.toArray(new URL[0]), classBytes, stubNeeds, poisonedClasses);
 
         ExecutorService pool = Executors.newFixedThreadPool(THREADS, r -> {
             Thread t = new Thread(r);
@@ -130,7 +150,9 @@ public class ENI_StringDumper {
         PrintStream originalErr = System.err;
         System.setErr(new PrintStream(new OutputStream() { public void write(int b) {} }));
 
-        CompletionService<ClassResult> cs = new ExecutorCompletionService<>(pool);
+        // Track futures individually so we can cancel hung tasks rather than
+        // waiting TIMEOUT_MS per slot when the pool is full of hanging threads.
+        List<Future<ClassResult>> futures = new ArrayList<>();
         int submitted = 0;
         for (String className : sortedClasses) {
             if (PACKAGE_FILTER != null && !className.startsWith(PACKAGE_FILTER)) {
@@ -140,22 +162,24 @@ public class ENI_StringDumper {
             submitted++;
             final String triggerMethod = (triggerSpec != null && triggerSpec.startsWith(className + "."))
                     ? triggerSpec.substring(className.length() + 1) : null;
-            cs.submit(() -> {
+            futures.add(pool.submit(() -> {
                 if (!IS_TERMINAL) System.out.println("[*] Processing class: " + className);
                 ClassResult r = processClass(loader, className, triggerMethod, results, errors, seenLines);
                 done.incrementAndGet();
                 return r;
-            });
+            }));
         }
 
         if (submitted == 0 && total > 0) System.err.println("[!] Warning: No classes matched the package filter.");
 
         int classCount = 0, failCount = 0;
-        for (int i = 0; i < submitted; i++) {
+        for (Future<ClassResult> f : futures) {
             try {
-                Future<ClassResult> f = cs.poll(TIMEOUT_MS, TimeUnit.MILLISECONDS);
-                if (f == null) { failCount++; continue; }
-                if (f.get() == ClassResult.FAIL) failCount++; else classCount++;
+                ClassResult r = f.get(TIMEOUT_MS, TimeUnit.MILLISECONDS);
+                if (r == ClassResult.FAIL) failCount++; else classCount++;
+            } catch (java.util.concurrent.TimeoutException te) {
+                f.cancel(true); // interrupt the hung thread immediately
+                failCount++;
             } catch (Exception e) { failCount++; }
         }
 
@@ -227,6 +251,8 @@ public class ENI_StringDumper {
             out.println("Settings:");
             out.println("  timeout=" + TIMEOUT_MS + "ms | threads=" + THREADS + " | depth=" + MAX_DEPTH);
             if (PACKAGE_FILTER != null) out.println("  filter=" + PACKAGE_FILTER);
+            if (!LIBS.isEmpty()) out.println("  libs=" + LIBS);
+            out.println("  brutemax=" + BRUTE_MAX);
             out.println();
             out.println("Package breakdown:");
             for (Map.Entry<String, List<DumpEntry>> pe : byPackage.entrySet())
@@ -251,11 +277,73 @@ public class ENI_StringDumper {
             Set<Object> visited = Collections.newSetFromMap(new IdentityHashMap<>());
             if (invokeStaticMethods(clazz, className, triggerMethodName, results, errors, seenLines, visited))
                 dumpStaticFields(clazz, className, results, errors, seenLines);
+            bruteForceDecryptors(clazz, className, results, errors, seenLines);
             dumpInstanceFields(clazz, className, results, errors, seenLines, visited);
             return ClassResult.OK;
         } catch (Throwable t) {
+            // Mark as poisoned so dependents can have their GETSTATIC calls patched out
+            loader.poisonedClasses.add(className);
             errors.add("[CLASS_FAIL] " + className + " -> " + fullCauseChain(t));
             return ClassResult.FAIL;
+        }
+    }
+
+    /**
+     * Brute-force invoke static methods that take a single int or long argument
+     * and return String or String[]. These are the decrypt(int index) style
+     * decryptors used by most modern obfuscators. We try indices 0..BRUTE_MAX-1.
+     * For String[] returns we call once and harvest all elements.
+     */
+    static void bruteForceDecryptors(Class<?> clazz, String className,
+                                      ConcurrentLinkedQueue<DumpEntry> results,
+                                      ConcurrentLinkedQueue<String> errors,
+                                      Set<String> seenLines) {
+        Method[] methods;
+        try { methods = clazz.getDeclaredMethods(); } catch (Throwable t) { return; }
+
+        for (Method m : methods) {
+            if (!Modifier.isStatic(m.getModifiers())) continue;
+            Class<?>[] params = m.getParameterTypes();
+            if (params.length != 1) continue;
+            Class<?> param = params[0];
+            boolean isInt  = param == int.class  || param == Integer.class;
+            boolean isLong = param == long.class  || param == Long.class;
+            if (!isInt && !isLong) continue;
+
+            Class<?> ret = m.getReturnType();
+            boolean returnsString      = ret == String.class;
+            boolean returnsStringArray = ret == String[].class;
+            if (!returnsString && !returnsStringArray) continue;
+
+            try { m.setAccessible(true); } catch (Throwable ignored) { continue; }
+            String label = m.getName() + "(brute)";
+
+            if (returnsStringArray) {
+                // Call once with 0 — the whole table comes back
+                try {
+                    Object result = isLong ? m.invoke(null, 0L) : m.invoke(null, 0);
+                    if (result instanceof String[]) {
+                        String[] arr = (String[]) result;
+                        for (int i = 0; i < arr.length; i++) {
+                            if (arr[i] != null && interesting(arr[i]))
+                                emit(results, seenLines, className, label, "[" + i + "]", arr[i]);
+                        }
+                    }
+                } catch (Throwable ignored) {}
+                continue;
+            }
+
+            // String return: try each index
+            for (int idx = 0; idx < BRUTE_MAX; idx++) {
+                try {
+                    Object result = isLong ? m.invoke(null, (long) idx) : m.invoke(null, idx);
+                    if (result instanceof String) {
+                        String s = (String) result;
+                        if (interesting(s))
+                            emit(results, seenLines, className, label, "[" + idx + "]", s);
+                    }
+                } catch (Throwable ignored) {}
+            }
         }
     }
 
@@ -278,6 +366,7 @@ public class ENI_StringDumper {
                                     ConcurrentLinkedQueue<DumpEntry> results,
                                     ConcurrentLinkedQueue<String> errors,
                                     Set<String> seenLines, Set<Object> visited) {
+        if (clazz.isInterface() || Modifier.isAbstract(clazz.getModifiers())) return;
         Constructor<?> ctor = null;
         try {
             for (Constructor<?> c : clazz.getDeclaredConstructors()) {
@@ -482,7 +571,7 @@ public class ENI_StringDumper {
                     }
                 }, ClassReader.SKIP_FRAMES | ClassReader.SKIP_DEBUG);
 
-                if (hasTimingCall[0] && methodCount[0] <= 8 && entry.getValue().length < 3000)
+                if (hasTimingCall[0] && methodCount[0] <= 8 && entry.getValue().length < 20000)
                     FLOW_STUB_CLASSES.add(name);
 
             } catch (Throwable ignored) {}
@@ -542,8 +631,16 @@ public class ENI_StringDumper {
     }
 
     static void emitZeroReturn(MethodVisitor mv, String ret, String descriptor, int opcode) {
-        int slots = countArgSlots(descriptor, opcode != Opcodes.INVOKESTATIC);
-        for (int i = 0; i < slots; i++) mv.visitInsn(Opcodes.POP);
+        // Pop all arguments (and receiver if non-static) before pushing the return value.
+        // Category-2 values (long, double) require POP2; everything else uses POP.
+        boolean hasThis = opcode != Opcodes.INVOKESTATIC;
+        org.objectweb.asm.Type[] argTypes = org.objectweb.asm.Type.getArgumentTypes(descriptor);
+        java.util.List<Integer> sizes = new java.util.ArrayList<>();
+        if (hasThis) sizes.add(1);
+        for (org.objectweb.asm.Type t : argTypes) sizes.add(t.getSize());
+        for (int i = sizes.size() - 1; i >= 0; i--) {
+            mv.visitInsn(sizes.get(i) == 2 ? Opcodes.POP2 : Opcodes.POP);
+        }
         switch (ret) {
             case "V":                                        break;
             case "J": mv.visitInsn(Opcodes.LCONST_0);      break;
@@ -551,6 +648,11 @@ public class ENI_StringDumper {
             case "F": mv.visitInsn(Opcodes.FCONST_0);      break;
             case "I": case "Z": case "B": case "C": case "S":
                       mv.visitInsn(Opcodes.ICONST_0);       break;
+            case "[B":
+                // Return empty byte[] rather than null so callers don't NPE on new String(bytes, charset).
+                mv.visitInsn(Opcodes.ICONST_0);
+                mv.visitIntInsn(Opcodes.NEWARRAY, org.objectweb.asm.Opcodes.T_BYTE);
+                break;
             default:  mv.visitInsn(Opcodes.ACONST_NULL);   break;
         }
     }
@@ -558,7 +660,7 @@ public class ENI_StringDumper {
     static byte[] patchAntiAnalysis(byte[] classBytes) {
         try {
             ClassReader cr = new ClassReader(classBytes);
-            ClassWriter cw = new ClassWriter(cr, ClassWriter.COMPUTE_MAXS);
+            ClassWriter cw = new ClassWriter(cr, ClassWriter.COMPUTE_FRAMES);
             cr.accept(new ClassVisitor(Opcodes.ASM9, cw) {
                 @Override
                 public MethodVisitor visitMethod(int access, String name, String descriptor,
@@ -576,9 +678,15 @@ public class ENI_StringDumper {
                                 super.visitInsn(Opcodes.ICONST_0);
                                 super.visitTypeInsn(Opcodes.ANEWARRAY, "java/lang/StackTraceElement"); return;
                             }
-                            if (owner.equals("java/lang/Thread") && mname.equals("currentThread")) {
-                                super.visitInsn(Opcodes.ACONST_NULL); return;
+                            // threadId() is Java 19+ API used as an anti-downgrade key.
+                            // Return a stable constant so <clinit> can complete and decrypt strings.
+                            // Must be patched before currentThread() to avoid NPE on the call chain.
+                            if (owner.equals("java/lang/Thread") && mname.equals("threadId")) {
+                                super.visitInsn(Opcodes.POP);
+                                super.visitLdcInsn(1L); return;
                             }
+                            // Do NOT stub Class.getName() globally — it may be used as a decryption key.
+                            // Do NOT stub currentThread() to null — threadId() would NPE.
                             if (owner.equals("java/lang/System") && mname.equals("currentTimeMillis")) {
                                 super.visitLdcInsn(1000L); return;
                             }
@@ -597,18 +705,43 @@ public class ENI_StringDumper {
                                     && (mname.equals("load") || mname.equals("loadLibrary"))) {
                                 super.visitInsn(Opcodes.POP); return;
                             }
+                            if (owner.equals("java/lang/System") && mname.equals("exit")) {
+                                super.visitInsn(Opcodes.POP); return;
+                            }
+                            // Block bytecode self-integrity checks: return null so the check sees no data.
+                            if ((owner.equals("java/lang/Class") || owner.equals("java/lang/ClassLoader"))
+                                    && mname.equals("getResourceAsStream")) {
+                                super.visitInsn(Opcodes.POP);
+                                super.visitInsn(Opcodes.POP);
+                                super.visitInsn(Opcodes.ACONST_NULL); return;
+                            }
                             if (owner.equals("java/lang/Runtime")
                                     && (mname.equals("load") || mname.equals("loadLibrary"))) {
                                 super.visitInsn(Opcodes.POP); super.visitInsn(Opcodes.POP); return;
                             }
+                            if (owner.equals("java/lang/Runtime") && mname.equals("halt")) {
+                                super.visitInsn(Opcodes.POP); super.visitInsn(Opcodes.POP); return;
+                            }
                             if (owner.equals("java/lang/StackWalker")) {
-                                super.visitInsn(Opcodes.ACONST_NULL); return;
+                                emitZeroReturn(this, descriptor.substring(descriptor.lastIndexOf(')') + 1), descriptor, opcode);
+                                return;
                             }
                             if (owner.equals("native0/Loader") && mname.equals("registerNativesForClass")) {
                                 super.visitInsn(Opcodes.POP); super.visitInsn(Opcodes.POP); return;
                             }
                             if (owner.equals("native0/hidden/Hidden0") && mname.startsWith("special_clinit_")) {
                                 super.visitInsn(Opcodes.POP); return;
+                            }
+                            // Stub Cipher/Mac operations to avoid cascade failure when key material is unavailable.
+                            if (owner.equals("javax/crypto/Cipher")
+                                    && (mname.equals("doFinal") || mname.equals("update"))) {
+                                emitZeroReturn(this, descriptor.substring(descriptor.lastIndexOf(')') + 1), descriptor, opcode);
+                                return;
+                            }
+                            if (owner.equals("javax/crypto/Mac")
+                                    && (mname.equals("doFinal") || mname.equals("update") || mname.equals("init"))) {
+                                emitZeroReturn(this, descriptor.substring(descriptor.lastIndexOf(')') + 1), descriptor, opcode);
+                                return;
                             }
                             if (FLOW_STUB_CLASSES.contains(owner.replace('/', '.'))) {
                                 emitZeroReturn(this, descriptor.substring(descriptor.lastIndexOf(')') + 1), descriptor, opcode);
@@ -625,24 +758,114 @@ public class ENI_StringDumper {
         }
     }
 
+    static byte[] recomputeFrames(byte[] classBytes) {
+        try {
+            ClassReader cr = new ClassReader(classBytes);
+            ClassWriter cw = new ClassWriter(cr, ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS);
+            cr.accept(cw, ClassReader.SKIP_FRAMES);
+            return cw.toByteArray();
+        } catch (Throwable t) {
+            return classBytes;
+        }
+    }
+
+    /**
+     * Rewrites exception handlers whose catch type is not a Throwable subclass
+     * to catch java/lang/Throwable instead, so the verifier accepts the bytecode.
+     */
+    static byte[] fixExceptionHandlers(byte[] classBytes) {
+        try {
+            ClassReader cr = new ClassReader(classBytes);
+            // Quick scan: does this class have any suspicious try-catch blocks?
+            boolean[] needsFix = {false};
+            cr.accept(new ClassVisitor(Opcodes.ASM9) {
+                @Override
+                public MethodVisitor visitMethod(int a, String n, String d, String s, String[] e) {
+                    return new MethodVisitor(Opcodes.ASM9) {
+                        @Override
+                        public void visitTryCatchBlock(org.objectweb.asm.Label start,
+                                org.objectweb.asm.Label end, org.objectweb.asm.Label handler, String type) {
+                            if (type != null && !type.startsWith("java/lang/") && !type.startsWith("java/io/")
+                                    && !type.startsWith("java/util/") && !type.startsWith("javax/")
+                                    && !type.startsWith("sun/") && !type.startsWith("jdk/")) {
+                                needsFix[0] = true;
+                            }
+                        }
+                    };
+                }
+            }, ClassReader.SKIP_FRAMES | ClassReader.SKIP_DEBUG);
+            if (!needsFix[0]) return classBytes;
+
+            // COMPUTE_FRAMES is required: changing catch types invalidates existing stack map frames.
+            // Resolve unknown types to Object to avoid ClassNotFoundException during frame computation.
+            ClassWriter cw = new ClassWriter(ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS) {
+                @Override
+                protected String getCommonSuperClass(String type1, String type2) {
+                    return "java/lang/Object";
+                }
+            };
+            cr.accept(new ClassVisitor(Opcodes.ASM9, cw) {
+                @Override
+                public MethodVisitor visitMethod(int access, String name, String desc, String sig, String[] exc) {
+                    MethodVisitor mv = super.visitMethod(access, name, desc, sig, exc);
+                    return new MethodVisitor(Opcodes.ASM9, mv) {
+                        @Override
+                        public void visitTryCatchBlock(org.objectweb.asm.Label start,
+                                org.objectweb.asm.Label end, org.objectweb.asm.Label handler, String type) {
+                            // Normalize non-Throwable catch types to Throwable
+                            if (type != null && !type.startsWith("java/lang/") && !type.startsWith("java/io/")
+                                    && !type.startsWith("java/util/") && !type.startsWith("javax/")
+                                    && !type.startsWith("sun/") && !type.startsWith("jdk/")) {
+                                super.visitTryCatchBlock(start, end, handler, "java/lang/Throwable");
+                            } else {
+                                super.visitTryCatchBlock(start, end, handler, type);
+                            }
+                        }
+                    };
+                }
+            }, ClassReader.SKIP_FRAMES);
+            return cw.toByteArray();
+        } catch (Throwable t) {
+            return classBytes;
+        }
+    }
+
     static class GhostClassLoader extends URLClassLoader {
         final Map<String, byte[]>  classBytes;
         private final Map<String, StubInfo>  stubNeeds;
         private final ConcurrentHashMap<String, Class<?>> defined = new ConcurrentHashMap<>();
+        final Set<String> poisonedClasses;
 
-        GhostClassLoader(URL[] urls, Map<String, byte[]> classBytes, Map<String, StubInfo> stubNeeds) {
+        GhostClassLoader(URL[] urls, Map<String, byte[]> classBytes, Map<String, StubInfo> stubNeeds,
+                         Set<String> poisonedClasses) {
             super(urls, null);
-            this.classBytes = classBytes;
-            this.stubNeeds  = stubNeeds;
+            this.classBytes      = classBytes;
+            this.stubNeeds       = stubNeeds;
+            this.poisonedClasses = poisonedClasses;
         }
 
         @Override
         protected Class<?> loadClass(String name, boolean resolve) throws ClassNotFoundException {
             Class<?> cached = defined.get(name);
             if (cached != null) return cached;
+            // Vendor library classes that require native loading always fail.
+            // Return a stub immediately rather than attempting to load and cascade-poisoning dependents.
+            if (isVendorClass(name)) {
+                return loadFromBytes(name, generateStub(stubNeeds.getOrDefault(name, new StubInfo(name, false))), resolve);
+            }
             if (isBootClass(name)) return getSystemClassLoader().loadClass(name);
             if (classBytes.containsKey(name))
                 return loadFromBytes(name, classBytes.get(name), resolve);
+            // Try parent URLs (library JARs) before falling back to stubs
+            try {
+                URL res = findResource(name.replace('.', '/') + ".class");
+                if (res != null) {
+                    try (InputStream is = res.openStream()) {
+                        byte[] bytes = readAllBytes(is);
+                        return loadFromBytes(name, bytes, resolve);
+                    }
+                }
+            } catch (Throwable ignored) {}
             if (DO_STUBS)
                 return loadFromBytes(name, generateStub(stubNeeds.getOrDefault(name, new StubInfo(name, false))), resolve);
             throw new ClassNotFoundException(name);
@@ -651,30 +874,126 @@ public class ENI_StringDumper {
         private Class<?> loadFromBytes(String name, byte[] bytes, boolean resolve) {
             Class<?> existing = defined.get(name);
             if (existing != null) return existing;
-
             synchronized (this) {
                 existing = defined.get(name);
                 if (existing != null) return existing;
-
                 byte[] patched = DO_PATCH ? patchAntiAnalysis(bytes) : bytes;
+                patched = patchPoisonedDeps(patched);
+                patched = fixExceptionHandlers(patched);
+                // Try patched bytes
                 try {
                     Class<?> clazz = defineClass(name, patched, 0, patched.length);
                     if (resolve) resolveClass(clazz);
                     defined.put(name, clazz);
                     return clazz;
-                } catch (Throwable t) {
-                    if (DO_PATCH && patched != bytes) {
+                } catch (Throwable t1) {
+                    // Try recomputing frames on the patched bytes
+                    try {
+                        byte[] reframed = recomputeFrames(patched);
+                        Class<?> clazz = defineClass(name, reframed, 0, reframed.length);
+                        if (resolve) resolveClass(clazz);
+                        defined.put(name, clazz);
+                        return clazz;
+                    } catch (Throwable t2) {
+                        // Try original bytes with frame recomputation
+                        if (patched != bytes) {
+                            try {
+                                byte[] reframed = recomputeFrames(bytes);
+                                Class<?> clazz = defineClass(name, reframed, 0, reframed.length);
+                                if (resolve) resolveClass(clazz);
+                                defined.put(name, clazz);
+                                return clazz;
+                            } catch (Throwable t3) {}
+                            try {
+                                Class<?> clazz = defineClass(name, bytes, 0, bytes.length);
+                                if (resolve) resolveClass(clazz);
+                                defined.put(name, clazz);
+                                return clazz;
+                            } catch (Throwable t3) {}
+                        }
+                        // Last resort: generate a stub so dependents don't cascade-fail
+                        poisonedClasses.add(name);
                         try {
-                            Class<?> clazz = defineClass(name, bytes, 0, bytes.length);
+                            byte[] stub = generateStub(stubNeeds.getOrDefault(name, new StubInfo(name, false)));
+                            Class<?> clazz = defineClass(name, stub, 0, stub.length);
                             if (resolve) resolveClass(clazz);
                             defined.put(name, clazz);
                             return clazz;
-                        } catch (Throwable t2) {
+                        } catch (Throwable t4) {
                             throw new RuntimeException("defineClass failed for " + name, t2);
                         }
                     }
-                    throw new RuntimeException("defineClass failed for " + name, t);
                 }
+            }
+        }
+
+        /**
+         * Patch out GETSTATIC instructions that reference fields on poisoned classes.
+         * When a class's <clinit> crashed, its static fields were never initialized.
+         * Any other class that reads those fields via GETSTATIC will get
+         * NoClassDefFoundError (cascade). We replace such GETSTATICs with a
+         * null/zero push of the appropriate type so dependents can load cleanly.
+         */
+        private byte[] patchPoisonedDeps(byte[] classBytes) {
+            if (poisonedClasses.isEmpty()) return classBytes;
+            try {
+                ClassReader cr = new ClassReader(classBytes);
+                // Quick check: does this class reference any poisoned class at all?
+                boolean[] hasDep = {false};
+                cr.accept(new ClassVisitor(Opcodes.ASM9) {
+                    @Override public MethodVisitor visitMethod(int a, String n, String d, String s, String[] e) {
+                        return new MethodVisitor(Opcodes.ASM9) {
+                            @Override public void visitFieldInsn(int op, String owner, String fn, String fd) {
+                                if (op == Opcodes.GETSTATIC && poisonedClasses.contains(owner.replace('/', '.')))
+                                    hasDep[0] = true;
+                            }
+                            @Override public void visitMethodInsn(int op, String owner, String name, String desc, boolean itf) {
+                                if (op == Opcodes.INVOKESTATIC && poisonedClasses.contains(owner.replace('/', '.')))
+                                    hasDep[0] = true;
+                            }
+                        };
+                    }
+                }, ClassReader.SKIP_FRAMES | ClassReader.SKIP_DEBUG);
+                if (!hasDep[0]) return classBytes;
+
+                ClassWriter cw = new ClassWriter(cr, ClassWriter.COMPUTE_FRAMES);
+                cr.accept(new ClassVisitor(Opcodes.ASM9, cw) {
+                    @Override
+                    public MethodVisitor visitMethod(int access, String name, String desc, String sig, String[] exc) {
+                        MethodVisitor mv = super.visitMethod(access, name, desc, sig, exc);
+                        return new MethodVisitor(Opcodes.ASM9, mv) {
+                            @Override
+                            public void visitFieldInsn(int opcode, String owner, String fname, String fdesc) {
+                                if (opcode == Opcodes.GETSTATIC
+                                        && poisonedClasses.contains(owner.replace('/', '.'))) {
+                                    // Push zero/null of the appropriate type instead
+                                    switch (fdesc) {
+                                        case "J": super.visitInsn(Opcodes.LCONST_0); break;
+                                        case "D": super.visitInsn(Opcodes.DCONST_0); break;
+                                        case "F": super.visitInsn(Opcodes.FCONST_0); break;
+                                        case "Z": case "B": case "C": case "S": case "I":
+                                            super.visitInsn(Opcodes.ICONST_0); break;
+                                        default:  super.visitInsn(Opcodes.ACONST_NULL); break;
+                                    }
+                                    return;
+                                }
+                                super.visitFieldInsn(opcode, owner, fname, fdesc);
+                            }
+
+                            @Override
+                            public void visitMethodInsn(int opcode, String owner, String mname, String descriptor, boolean isInterface) {
+                                if (opcode == Opcodes.INVOKESTATIC && poisonedClasses.contains(owner.replace('/', '.'))) {
+                                    emitZeroReturn(this, descriptor.substring(descriptor.lastIndexOf(')') + 1), descriptor, opcode);
+                                    return;
+                                }
+                                super.visitMethodInsn(opcode, owner, mname, descriptor, isInterface);
+                            }
+                        };
+                    }
+                }, ClassReader.EXPAND_FRAMES);
+                return cw.toByteArray();
+            } catch (Throwable t) {
+                return classBytes;
             }
         }
 
@@ -683,6 +1002,13 @@ public class ENI_StringDumper {
                     || name.startsWith("sun.") || name.startsWith("com.sun.")
                     || name.startsWith("jdk.") || name.startsWith("org.xml.")
                     || name.startsWith("org.w3c.");
+        }
+
+        private static boolean isVendorClass(String name) {
+            return name.startsWith("org.lwjgl.")
+                || name.startsWith("net.java.games.")
+                || name.startsWith("org.joml.")
+                || name.startsWith("com.sun.jna.");
         }
     }
 
@@ -813,7 +1139,9 @@ public class ENI_StringDumper {
             else if (c > 0x7e) highByte++;
             else printableAscii++;
         }
-        return ctrl / (double) len < 0.15 && highByte / (double) len <= 0.40 && printableAscii >= 3;
+        // Tightened: reject any control chars (ciphertext) and cap high-byte at 10%.
+        // DES/XOR ciphertext typically contains 5-20% control bytes; real strings have 0.
+        return ctrl == 0 && highByte / (double) len <= 0.10 && printableAscii >= 3;
     }
 
     static boolean interesting(String s) {
@@ -1035,10 +1363,12 @@ public class ENI_StringDumper {
         System.out.println("Usage: java -cp \".;asm-9.8.jar\" ENI_StringDumper [options] <target.jar> [Class.method]");
         System.out.println("Options:");
         System.out.println("  -package <prefix> Filter classes by package (e.g., com.example)");
+        System.out.println("  -libs <jar>       Library JAR to add to classloader (repeatable; use for Minecraft jar etc.)");
         System.out.println("  -json             Write per-package JSON files alongside plain logs");
         System.out.println("  -timeout <ms>     Per-class timeout (default 3000)");
         System.out.println("  -threads <n>      Thread pool size (default: CPU count)");
         System.out.println("  -depth <n>        Max recursion depth (default 10)");
+        System.out.println("  -brutemax <n>     Max index for parameterized decryptor brute-force (default 512)");
         System.out.println("  -nopatch          Skip anti-analysis patching");
         System.out.println("  -nostubs          Skip ghost class stubs");
         System.out.println("  -out <dir>        Output directory");
