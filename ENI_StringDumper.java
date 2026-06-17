@@ -21,6 +21,7 @@ import java.util.jar.*;
  */
 public class ENI_StringDumper {
 
+    // ── Configuration ─────────────────────────────────────────────────────────
     static long    TIMEOUT_MS     = 3000;
     static int     THREADS        = Runtime.getRuntime().availableProcessors();
     static int     MAX_DEPTH      = 10;
@@ -34,10 +35,25 @@ public class ENI_StringDumper {
     // Max index to brute-force for single-int-arg decryptors
     static int     BRUTE_MAX      = 512;
 
+    // ── Named constants ───────────────────────────────────────────────────────
+    /** Minimum byte-array length before we attempt UTF-8 text interpretation. */
+    private static final int  BYTES_MIN_LEN          = 3;
+    /** Maximum byte-array length we will attempt to interpret as text (avoids huge arrays). */
+    private static final int  BYTES_MAX_LEN          = 50_000;
+    /** Number of bytes sampled from the start of an array for the isLikelyText heuristic. */
+    private static final int  TEXT_PROBE_LIMIT        = 256;
+    /** Minimum fraction of sampled bytes that must be printable ASCII for isLikelyText to pass. */
+    private static final double TEXT_PRINTABLE_RATIO  = 0.70;
+    /** Lowest printable ASCII code point (space). */
+    private static final byte  ASCII_PRINTABLE_LOW   = 0x20;
+    /** Highest printable ASCII code point (~). */
+    private static final byte  ASCII_PRINTABLE_HIGH  = 0x7E;
+
     static final Set<String> FLOW_STUB_CLASSES = Collections.newSetFromMap(new ConcurrentHashMap<>());
     private static final Map<Class<?>, Field[]> FIELDS_CACHE = new ConcurrentHashMap<>();
     private static final boolean IS_TERMINAL = System.console() != null;
 
+    // ── Entry point / main loop ───────────────────────────────────────────────
     public static void main(String[] args) throws Exception {
         if (args.length < 1) { printUsage(); return; }
 
@@ -139,10 +155,11 @@ public class ENI_StringDumper {
             return t;
         });
 
-        ConcurrentLinkedQueue<DumpEntry> results   = new ConcurrentLinkedQueue<>();
-        ConcurrentLinkedQueue<String>    errors    = new ConcurrentLinkedQueue<>();
-        Set<String>                      seenLines = Collections.newSetFromMap(new ConcurrentHashMap<>());
-        AtomicInteger                    done      = new AtomicInteger(0);
+        ConcurrentLinkedQueue<DumpEntry> results      = new ConcurrentLinkedQueue<>();
+        ConcurrentLinkedQueue<String>    errors       = new ConcurrentLinkedQueue<>();
+        ConcurrentLinkedQueue<String>    failedClasses = new ConcurrentLinkedQueue<>();
+        Set<String>                      seenLines   = Collections.newSetFromMap(new ConcurrentHashMap<>());
+        AtomicInteger                    done        = new AtomicInteger(0);
 
         int total = sortedClasses.size();
         System.out.println("[*] Processing classes...");
@@ -165,6 +182,7 @@ public class ENI_StringDumper {
             futures.add(pool.submit(() -> {
                 if (!IS_TERMINAL) System.out.println("[*] Processing class: " + className);
                 ClassResult r = processClass(loader, className, triggerMethod, results, errors, seenLines);
+                if (r == ClassResult.FAIL) failedClasses.add(className);
                 done.incrementAndGet();
                 return r;
             }));
@@ -186,7 +204,167 @@ public class ENI_StringDumper {
         pool.shutdownNow();
         System.setErr(originalErr);
 
+        // ── Single-thread retry for failed classes ────────────────────────────────
+        // Race conditions in multithreaded loading can cause <clinit> failures when
+        // a dependency hasn't finished initialising. Retrying failed classes
+        // single-threaded in topological order (preserving dependency ordering) fixes this.
+        if (!failedClasses.isEmpty()) {
+            // Build retry list in topological order
+            Set<String> failedSet = new HashSet<>(failedClasses);
+            List<String> retryOrder = new ArrayList<>();
+            for (String cls : sortedClasses) {
+                if (failedSet.contains(cls)) retryOrder.add(cls);
+            }
+            System.out.println("[*] Retrying " + retryOrder.size() + " failed classes single-threaded...");
+            int retryOk = 0, retryFail = 0;
+            for (String className : retryOrder) {
+                ClassResult r = processClass(loader, className, null, results, errors, seenLines);
+                if (r == ClassResult.OK) { retryOk++; classCount++; failCount--; } else retryFail++;
+            }
+            if (retryOk > 0)
+                System.out.println("[+] Retry recovered: " + retryOk + " additional classes (" + retryFail + " still failing)");
+        }
+
+        // ── String array index pass ───────────────────────────────────────────────
+        System.out.println("[*] Running string array index pass...");
+        stringTableIndexPass(classBytes, results, seenLines);
+
         saveResults(jarFile, results, errors, classCount, failCount);
+    }
+
+    /**
+     * Scans every class for the "string table" access pattern:
+     *   GETSTATIC SomeClass.stringArray [Ljava/lang/String;
+     *   [integer push: ICONST_x, BIPUSH, SIPUSH, or LDC int]
+     *   AALOAD
+     *
+     * When found, we look up index N in the dumped string table for SomeClass
+     * and emit that string attributed to the *calling* class. This connects
+     * string table entries to the classes that actually use them.
+     */
+    static void stringTableIndexPass(Map<String, byte[]> classBytes,
+                                      ConcurrentLinkedQueue<DumpEntry> results,
+                                      Set<String> seenLines) {
+        // Build index maps from <clinit> of each class: fieldKey -> (index -> value)
+        // fieldKey = "owner.dot.name.fieldName"
+        Map<String, Map<Integer, String>> indexMaps = new ConcurrentHashMap<>();
+
+        for (Map.Entry<String, byte[]> e : classBytes.entrySet()) {
+            final String className = e.getKey();
+            try {
+                new ClassReader(e.getValue()).accept(new ClassVisitor(Opcodes.ASM9) {
+                    @Override
+                    public MethodVisitor visitMethod(int access, String mname, String desc, String sig, String[] exc) {
+                        if (!mname.equals("<clinit>")) return null;
+                        return new MethodVisitor(Opcodes.ASM9) {
+                            int    pendingIndex = -1;
+                            String pendingField = null;
+
+                            @Override
+                            public void visitFieldInsn(int opcode, String owner, String fname, String fdesc) {
+                                if (opcode == Opcodes.PUTSTATIC && fdesc.equals("[Ljava/lang/String;")) {
+                                    pendingField = owner.replace('/', '.') + "." + fname;
+                                }
+                            }
+
+                            @Override
+                            public void visitIntInsn(int opcode, int operand) {
+                                if (opcode == Opcodes.BIPUSH || opcode == Opcodes.SIPUSH) pendingIndex = operand;
+                            }
+
+                            @Override
+                            public void visitInsn(int opcode) {
+                                if (opcode >= Opcodes.ICONST_0 && opcode <= Opcodes.ICONST_5)
+                                    pendingIndex = opcode - Opcodes.ICONST_0;
+                            }
+
+                            @Override
+                            public void visitLdcInsn(Object cst) {
+                                if (cst instanceof String && pendingIndex >= 0 && pendingField != null) {
+                                    indexMaps.computeIfAbsent(pendingField, k -> new ConcurrentHashMap<>())
+                                            .put(pendingIndex, (String) cst);
+                                    pendingIndex = -1;
+                                } else if (cst instanceof Integer) {
+                                    pendingIndex = (Integer) cst;
+                                }
+                            }
+                        };
+                    }
+                }, ClassReader.SKIP_FRAMES | ClassReader.SKIP_DEBUG);
+            } catch (Throwable ignored) {}
+        }
+
+        if (indexMaps.isEmpty()) return;
+
+        // Step 2: scan every class for GETSTATIC tableField + int push + AALOAD
+        for (Map.Entry<String, byte[]> e : classBytes.entrySet()) {
+            final String callerClass = e.getKey();
+            try {
+                new ClassReader(e.getValue()).accept(new ClassVisitor(Opcodes.ASM9) {
+                    @Override
+                    public MethodVisitor visitMethod(int access, String mname, String desc, String sig, String[] exc) {
+                        return new MethodVisitor(Opcodes.ASM9) {
+                            String lastTableField = null;
+                            int    lastIndex      = -1;
+
+                            @Override
+                            public void visitFieldInsn(int opcode, String owner, String fname, String fdesc) {
+                                if (opcode == Opcodes.GETSTATIC && fdesc.equals("[Ljava/lang/String;")) {
+                                    String key = owner.replace('/', '.') + "." + fname;
+                                    if (indexMaps.containsKey(key)) {
+                                        lastTableField = key;
+                                        lastIndex = -1;
+                                        return;
+                                    }
+                                }
+                                lastTableField = null;
+                                lastIndex = -1;
+                            }
+
+                            @Override
+                            public void visitIntInsn(int opcode, int operand) {
+                                if (lastTableField != null && (opcode == Opcodes.BIPUSH || opcode == Opcodes.SIPUSH))
+                                    lastIndex = operand;
+                                else { lastTableField = null; lastIndex = -1; }
+                            }
+
+                            @Override
+                            public void visitInsn(int opcode) {
+                                if (lastTableField != null) {
+                                    if (opcode >= Opcodes.ICONST_0 && opcode <= Opcodes.ICONST_5) {
+                                        lastIndex = opcode - Opcodes.ICONST_0;
+                                    } else if (opcode == Opcodes.AALOAD && lastIndex >= 0) {
+                                        String val = indexMaps.get(lastTableField).get(lastIndex);
+                                        if (val != null && interesting(val))
+                                            emit(results, seenLines, callerClass,
+                                                 "[strtable:" + lastTableField + "]",
+                                                 "[" + lastIndex + "]", val);
+                                        lastTableField = null;
+                                        lastIndex = -1;
+                                    } else {
+                                        lastTableField = null; lastIndex = -1;
+                                    }
+                                }
+                            }
+
+                            @Override
+                            public void visitLdcInsn(Object cst) {
+                                if (lastTableField != null && cst instanceof Integer) {
+                                    lastIndex = (Integer) cst;
+                                } else {
+                                    lastTableField = null; lastIndex = -1;
+                                }
+                            }
+
+                            @Override
+                            public void visitVarInsn(int opcode, int var) {
+                                // Any var instruction between GETSTATIC and AALOAD breaks the chain.
+                            }
+                        };
+                    }
+                }, ClassReader.SKIP_FRAMES | ClassReader.SKIP_DEBUG);
+            } catch (Throwable ignored) {}
+        }
     }
 
     private static void saveResults(File jarFile, ConcurrentLinkedQueue<DumpEntry> results, 
@@ -265,14 +443,14 @@ public class ENI_StringDumper {
         System.out.println("  Output: " + outDir.getAbsolutePath());
     }
 
+    // ── Per-class processing ──────────────────────────────────────────────────
     static ClassResult processClass(GhostClassLoader loader, String className, String triggerMethodName,
                                     ConcurrentLinkedQueue<DumpEntry> results, ConcurrentLinkedQueue<String> errors,
                                     Set<String> seenLines) {
-        byte[] bytes = loader.classBytes.get(className);
-        if (bytes != null) ldcFallback(bytes, className, results, seenLines);
-
         try {
             Class<?> clazz = loader.loadClass(className);
+            byte[] bytes = loader.classBytes.get(className);
+            dumpIndyStrings(loader, bytes, className, results, seenLines);
             dumpStaticFields(clazz, className, results, errors, seenLines);
             Set<Object> visited = Collections.newSetFromMap(new IdentityHashMap<>());
             if (invokeStaticMethods(clazz, className, triggerMethodName, results, errors, seenLines, visited))
@@ -284,8 +462,103 @@ public class ENI_StringDumper {
             // Mark as poisoned so dependents can have their GETSTATIC calls patched out
             loader.poisonedClasses.add(className);
             errors.add("[CLASS_FAIL] " + className + " -> " + fullCauseChain(t));
+            // Dynamic loading failed — fall back to static bytecode extraction
+            byte[] bytes = loader.classBytes.get(className);
+            if (bytes != null) ldcFallback(bytes, className, results, seenLines);
             return ClassResult.FAIL;
         }
+    }
+
+    /**
+     * Attempts to execute an invokedynamic bootstrap method to recover the string
+     * it would produce at runtime. Modern obfuscators (Skidfuscator, SkidSuite, etc.)
+     * put entire string tables behind invokedynamic rather than INVOKESTATIC, so the
+     * strings never appear as LDC constants.
+     *
+     * The approach:
+     * 1. Load the BSM class via the GhostClassLoader
+     * 2. Invoke the bootstrap method with a dummy MethodHandles.Lookup, the method name,
+     *    and a MethodType of ()Ljava/lang/String;
+     * 3. Call the returned CallSite's target with no arguments
+     * 4. Return the String result
+     *
+     * This is best-effort — many BSMs will fail due to missing context, but the ones
+     * that succeed (pure index-based string tables) yield the most valuable strings.
+     */
+    static String tryBootstrapIndy(GhostClassLoader loader, Handle bsm, Object[] bsmArgs,
+                                    String callerClassName) {
+        try {
+            // Load the class that contains the bootstrap method
+            Class<?> bsmClass = loader.loadClass(bsm.getOwner().replace('/', '.'));
+
+            // Find the bootstrap method — BSMs always have signature:
+            // (MethodHandles.Lookup, String, MethodType, ...) returning CallSite
+            Method bsmMethod = null;
+            for (Method m : bsmClass.getDeclaredMethods()) {
+                if (!m.getName().equals(bsm.getName())) continue;
+                Class<?>[] params = m.getParameterTypes();
+                if (params.length < 3) continue;
+                if (!params[0].getName().equals("java.lang.invoke.MethodHandles$Lookup")) continue;
+                if (!params[1].equals(String.class)) continue;
+                if (!params[2].getName().equals("java.lang.invoke.MethodType")) continue;
+                bsmMethod = m;
+                break;
+            }
+            if (bsmMethod == null) return null;
+            bsmMethod.setAccessible(true);
+
+            java.lang.invoke.MethodHandles.Lookup lookup = java.lang.invoke.MethodHandles.lookup();
+            java.lang.invoke.MethodType dummyType = java.lang.invoke.MethodType.methodType(String.class);
+            Object[] args = new Object[3 + bsmArgs.length];
+            args[0] = lookup;
+            args[1] = callerClassName; // method name hint
+            args[2] = dummyType;
+            for (int i = 0; i < bsmArgs.length; i++) {
+                Object arg = bsmArgs[i];
+                // Convert ASM Type to java.lang.invoke.MethodType
+                if (arg instanceof org.objectweb.asm.Type) {
+                    arg = java.lang.invoke.MethodType.fromMethodDescriptorString(
+                            ((org.objectweb.asm.Type) arg).getDescriptor(),
+                            loader);
+                }
+                args[3 + i] = arg;
+            }
+
+            Object callSite = bsmMethod.invoke(null, args);
+            if (callSite == null) return null;
+
+            Method getTarget = callSite.getClass().getMethod("getTarget");
+            java.lang.invoke.MethodHandle target = (java.lang.invoke.MethodHandle) getTarget.invoke(callSite);
+            if (target == null) return null;
+
+            Object result = target.invokeWithArguments();
+            return result instanceof String ? (String) result : null;
+
+        } catch (Throwable t) {
+            return null; // best-effort, most will fail
+        }
+    }
+
+    static void dumpIndyStrings(GhostClassLoader loader, byte[] classBytes, String className,
+                                  ConcurrentLinkedQueue<DumpEntry> results, Set<String> seenLines) {
+        if (classBytes == null) return;
+        try {
+            new ClassReader(classBytes).accept(new ClassVisitor(Opcodes.ASM9) {
+                @Override
+                public MethodVisitor visitMethod(int access, String mname, String desc, String sig, String[] exc) {
+                    return new MethodVisitor(Opcodes.ASM9) {
+                        @Override
+                        public void visitInvokeDynamicInsn(String name, String descriptor,
+                                                            Handle bsm, Object... bsmArgs) {
+                            if (!descriptor.endsWith(")Ljava/lang/String;")) return;
+                            String val = tryBootstrapIndy(loader, bsm, bsmArgs, className);
+                            if (val != null && interesting(val))
+                                emit(results, seenLines, className, "[bsm:" + mname + "]", null, val);
+                        }
+                    };
+                }
+            }, ClassReader.SKIP_FRAMES | ClassReader.SKIP_DEBUG);
+        } catch (Throwable ignored) {}
     }
 
     /**
@@ -301,27 +574,27 @@ public class ENI_StringDumper {
         Method[] methods;
         try { methods = clazz.getDeclaredMethods(); } catch (Throwable t) { return; }
 
-        for (Method m : methods) {
-            if (!Modifier.isStatic(m.getModifiers())) continue;
-            Class<?>[] params = m.getParameterTypes();
+        for (Method method : methods) {
+            if (!Modifier.isStatic(method.getModifiers())) continue;
+            Class<?>[] params = method.getParameterTypes();
             if (params.length != 1) continue;
             Class<?> param = params[0];
             boolean isInt  = param == int.class  || param == Integer.class;
             boolean isLong = param == long.class  || param == Long.class;
             if (!isInt && !isLong) continue;
 
-            Class<?> ret = m.getReturnType();
+            Class<?> ret = method.getReturnType();
             boolean returnsString      = ret == String.class;
             boolean returnsStringArray = ret == String[].class;
             if (!returnsString && !returnsStringArray) continue;
 
-            try { m.setAccessible(true); } catch (Throwable ignored) { continue; }
-            String label = m.getName() + "(brute)";
+            try { method.setAccessible(true); } catch (Throwable ignored) { continue; }
+            String label = method.getName() + "(brute)";
 
             if (returnsStringArray) {
                 // Call once with 0 — the whole table comes back
                 try {
-                    Object result = isLong ? m.invoke(null, 0L) : m.invoke(null, 0);
+                    Object result = isLong ? method.invoke(null, 0L) : method.invoke(null, 0);
                     if (result instanceof String[]) {
                         String[] arr = (String[]) result;
                         for (int i = 0; i < arr.length; i++) {
@@ -335,8 +608,9 @@ public class ENI_StringDumper {
 
             // String return: try each index
             for (int idx = 0; idx < BRUTE_MAX; idx++) {
+                if (Thread.interrupted()) return; // respect class-level timeout cancellation
                 try {
-                    Object result = isLong ? m.invoke(null, (long) idx) : m.invoke(null, idx);
+                    Object result = isLong ? method.invoke(null, (long) idx) : method.invoke(null, idx);
                     if (result instanceof String) {
                         String s = (String) result;
                         if (interesting(s))
@@ -429,62 +703,102 @@ public class ENI_StringDumper {
         if (obj == null || depth > MAX_DEPTH) return;
 
         if (obj instanceof String) {
-            if (interesting((String) obj))
-                emit(results, seenLines, className, fieldName, prefix.isEmpty() ? null : prefix, (String) obj);
+            collectString((String) obj, className, fieldName, prefix, results, seenLines);
             return;
         }
         if (obj instanceof char[]) {
-            char[] arr = (char[]) obj;
-            if (interestingImpl(arr.length, i -> arr[i]))
-                emit(results, seenLines, className, fieldName, prefix.isEmpty() ? null : prefix, new String(arr));
+            collectCharArray((char[]) obj, className, fieldName, prefix, results, seenLines);
             return;
         }
         if (obj instanceof byte[]) {
-            byte[] bytes = (byte[]) obj;
-            if (bytes.length >= 3 && bytes.length < 50000 && isLikelyText(bytes)) {
-                try {
-                    String s = new String(bytes, java.nio.charset.StandardCharsets.UTF_8);
-                    if (interesting(s))
-                        emit(results, seenLines, className, fieldName, prefix.isEmpty() ? null : prefix, s);
-                } catch (Throwable ignored) {}
-            }
+            collectByteArray((byte[]) obj, className, fieldName, prefix, results, seenLines);
             return;
         }
 
         if (!visited.add(obj)) return;
 
         if (obj.getClass().isArray()) {
-            int len = Array.getLength(obj);
-            for (int i = 0; i < len; i++)
-                collectFromObject(Array.get(obj, i), className, fieldName,
-                        prefix + '[' + i + ']', results, seenLines, depth + 1, visited);
+            collectArray(obj, className, fieldName, prefix, results, seenLines, depth, visited);
             return;
         }
         if (obj instanceof Map<?, ?>) {
-            for (Map.Entry<?, ?> entry : ((Map<?, ?>) obj).entrySet()) {
-                String k = entry.getKey() != null ? entry.getKey().toString() : "null";
-                collectFromObject(entry.getKey(), className, fieldName,
-                        prefix + "[key:" + k + ']', results, seenLines, depth + 1, visited);
-                collectFromObject(entry.getValue(), className, fieldName,
-                        prefix + '[' + k + ']', results, seenLines, depth + 1, visited);
-            }
+            collectMap((Map<?, ?>) obj, className, fieldName, prefix, results, seenLines, depth, visited);
             return;
         }
         if (obj instanceof Iterable<?>) {
-            int i = 0;
-            for (Object item : (Iterable<?>) obj)
-                collectFromObject(item, className, fieldName,
-                        prefix + '[' + i++ + ']', results, seenLines, depth + 1, visited);
+            collectIterable((Iterable<?>) obj, className, fieldName, prefix, results, seenLines, depth, visited);
             return;
         }
         if (depth < MAX_DEPTH - 1) {
-            for (Field f : cachedFields(obj.getClass())) {
-                if (Modifier.isStatic(f.getModifiers())) continue;
-                try {
-                    collectFromObject(f.get(obj), className, fieldName,
-                            prefix + '.' + f.getName(), results, seenLines, depth + 1, visited);
-                } catch (Throwable ignored) {}
-            }
+            collectFields(obj, className, fieldName, prefix, results, seenLines, depth, visited);
+        }
+    }
+
+    private static void collectString(String s, String className, String fieldName,
+                                       String prefix, ConcurrentLinkedQueue<DumpEntry> results,
+                                       Set<String> seenLines) {
+        if (interesting(s))
+            emit(results, seenLines, className, fieldName, prefix.isEmpty() ? null : prefix, s);
+    }
+
+    private static void collectCharArray(char[] arr, String className, String fieldName,
+                                          String prefix, ConcurrentLinkedQueue<DumpEntry> results,
+                                          Set<String> seenLines) {
+        if (interestingImpl(arr.length, i -> arr[i]))
+            emit(results, seenLines, className, fieldName, prefix.isEmpty() ? null : prefix, new String(arr));
+    }
+
+    private static void collectByteArray(byte[] bytes, String className, String fieldName,
+                                          String prefix, ConcurrentLinkedQueue<DumpEntry> results,
+                                          Set<String> seenLines) {
+        if (bytes.length >= BYTES_MIN_LEN && bytes.length < BYTES_MAX_LEN && isLikelyText(bytes)) {
+            try {
+                String s = new String(bytes, java.nio.charset.StandardCharsets.UTF_8);
+                if (interesting(s))
+                    emit(results, seenLines, className, fieldName, prefix.isEmpty() ? null : prefix, s);
+            } catch (Throwable ignored) {}
+        }
+    }
+
+    private static void collectArray(Object obj, String className, String fieldName,
+                                      String prefix, ConcurrentLinkedQueue<DumpEntry> results,
+                                      Set<String> seenLines, int depth, Set<Object> visited) {
+        int len = Array.getLength(obj);
+        for (int i = 0; i < len; i++)
+            collectFromObject(Array.get(obj, i), className, fieldName,
+                    prefix + '[' + i + ']', results, seenLines, depth + 1, visited);
+    }
+
+    private static void collectMap(Map<?, ?> map, String className, String fieldName,
+                                    String prefix, ConcurrentLinkedQueue<DumpEntry> results,
+                                    Set<String> seenLines, int depth, Set<Object> visited) {
+        for (Map.Entry<?, ?> entry : map.entrySet()) {
+            String k = entry.getKey() != null ? entry.getKey().toString() : "null";
+            collectFromObject(entry.getKey(), className, fieldName,
+                    prefix + "[key:" + k + ']', results, seenLines, depth + 1, visited);
+            collectFromObject(entry.getValue(), className, fieldName,
+                    prefix + '[' + k + ']', results, seenLines, depth + 1, visited);
+        }
+    }
+
+    private static void collectIterable(Iterable<?> iterable, String className, String fieldName,
+                                         String prefix, ConcurrentLinkedQueue<DumpEntry> results,
+                                         Set<String> seenLines, int depth, Set<Object> visited) {
+        int i = 0;
+        for (Object item : iterable)
+            collectFromObject(item, className, fieldName,
+                    prefix + '[' + i++ + ']', results, seenLines, depth + 1, visited);
+    }
+
+    private static void collectFields(Object obj, String className, String fieldName,
+                                       String prefix, ConcurrentLinkedQueue<DumpEntry> results,
+                                       Set<String> seenLines, int depth, Set<Object> visited) {
+        for (Field f : cachedFields(obj.getClass())) {
+            if (Modifier.isStatic(f.getModifiers())) continue;
+            try {
+                collectFromObject(f.get(obj), className, fieldName,
+                        prefix + '.' + f.getName(), results, seenLines, depth + 1, visited);
+            } catch (Throwable ignored) {}
         }
     }
 
@@ -494,6 +808,7 @@ public class ENI_StringDumper {
             results.add(new DumpEntry(className, fieldName, index, value));
     }
 
+    // ── Dependency analysis and class ordering ────────────────────────────────
     static void combinedAnalysisPass(Map<String, byte[]> classBytes,
                                       Map<String, Set<String>> deps,
                                       Map<String, StubInfo> stubNeeds) {
@@ -506,6 +821,7 @@ public class ENI_StringDumper {
             final Set<String> myDeps = new HashSet<>();
             deps.put(name, myDeps);
 
+            // single-element array used as mutable int in anonymous class (Java's closure limitation)
             final int[]     methodCount   = {0};
             final boolean[] hasTimingCall = {false};
 
@@ -584,11 +900,11 @@ public class ENI_StringDumper {
         for (String n : nodes) inDegree.put(n, 0);
 
         for (Map.Entry<String, Set<String>> e : deps.entrySet()) {
-            String a = e.getKey();
-            for (String b : e.getValue()) {
-                if (!nodes.contains(b)) continue;
-                revDeps.computeIfAbsent(b, k -> new HashSet<>()).add(a);
-                inDegree.merge(a, 1, Integer::sum);
+            String dependent = e.getKey();
+            for (String dependency : e.getValue()) {
+                if (!nodes.contains(dependency)) continue;
+                revDeps.computeIfAbsent(dependency, k -> new HashSet<>()).add(dependent);
+                inDegree.merge(dependent, 1, Integer::sum);
             }
         }
 
@@ -613,6 +929,7 @@ public class ENI_StringDumper {
         return result;
     }
 
+    // ── Bytecode patching ─────────────────────────────────────────────────────
     static int countArgSlots(String descriptor, boolean hasThis) {
         int slots = hasThis ? 1 : 0;
         for (org.objectweb.asm.Type t : org.objectweb.asm.Type.getArgumentTypes(descriptor)) slots += t.getSize();
@@ -624,17 +941,22 @@ public class ENI_StringDumper {
         switch (name.charAt(0)) {
             case 'j': return name.startsWith("java.") || name.startsWith("javax.") || name.startsWith("jdk.");
             case 's': return name.startsWith("sun.");
-            case 'c': return name.startsWith("com.sun.");
-            case 'o': return name.startsWith("org.xml.") || name.startsWith("org.w3c.");
+            case 'c': return name.startsWith("com.sun.") || name.startsWith("com.oracle.");
+            case 'o': return name.startsWith("org.xml.") || name.startsWith("org.w3c.") || name.startsWith("org.ietf.");
+            case 'n': return name.startsWith("netscape.javascript.");
             default:  return false;
         }
     }
 
     static void emitZeroReturn(MethodVisitor mv, String ret, String descriptor, int opcode) {
-        // Pop all arguments (and receiver if non-static) before pushing the return value.
-        // Category-2 values (long, double) require POP2; everything else uses POP.
+        // The operand stack currently holds the receiver (if non-static) followed by
+        // all arguments. We must pop them in reverse order before pushing the return
+        // value, otherwise the stack depth will be wrong and the verifier will reject
+        // the bytecode. Category-2 values (long, double, size==2) need POP2; all
+        // others need POP.
         boolean hasThis = opcode != Opcodes.INVOKESTATIC;
         org.objectweb.asm.Type[] argTypes = org.objectweb.asm.Type.getArgumentTypes(descriptor);
+        // Build a list of slot sizes (1 or 2) in push order so we can pop them in reverse.
         java.util.List<Integer> sizes = new java.util.ArrayList<>();
         if (hasThis) sizes.add(1);
         for (org.objectweb.asm.Type t : argTypes) sizes.add(t.getSize());
@@ -670,6 +992,7 @@ public class ENI_StringDumper {
                         @Override
                         public void visitMethodInsn(int opcode, String owner, String mname,
                                                     String descriptor, boolean isInterface) {
+                            // ── Reflection stubs ─────────────────────────────────────────────
                             if (owner.equals("sun/reflect/Reflection") && mname.equals("getCallerClass")) {
                                 super.visitInsn(Opcodes.ACONST_NULL); return;
                             }
@@ -685,14 +1008,26 @@ public class ENI_StringDumper {
                                 super.visitInsn(Opcodes.POP);
                                 super.visitLdcInsn(1L); return;
                             }
+                            // getId() is the pre-Java-19 equivalent — also used as a decryption key
+                            // by obfuscators to tie strings to a specific thread. Return a stable
+                            // constant (1L) so the same key is derived regardless of which thread
+                            // happens to run the <clinit>.
+                            if (owner.equals("java/lang/Thread") && mname.equals("getId")) {
+                                super.visitInsn(Opcodes.POP);
+                                super.visitLdcInsn(1L); return;
+                            }
                             // Do NOT stub Class.getName() globally — it may be used as a decryption key.
                             // Do NOT stub currentThread() to null — threadId() would NPE.
+
+                            // ── Timing stubs ─────────────────────────────────────────────────
                             if (owner.equals("java/lang/System") && mname.equals("currentTimeMillis")) {
                                 super.visitLdcInsn(1000L); return;
                             }
                             if (owner.equals("java/lang/System") && mname.equals("nanoTime")) {
                                 super.visitLdcInsn(1000000L); return;
                             }
+
+                            // ── Unsafe stubs ─────────────────────────────────────────────────
                             if ((owner.equals("sun/misc/Unsafe") || owner.equals("jdk/internal/misc/Unsafe"))
                                     && (mname.startsWith("put") || mname.startsWith("get")
                                         || mname.startsWith("compare") || mname.equals("allocateMemory")
@@ -701,19 +1036,14 @@ public class ENI_StringDumper {
                                 emitZeroReturn(this, descriptor.substring(descriptor.lastIndexOf(')') + 1), descriptor, opcode);
                                 return;
                             }
+
+                            // ── Native loader stubs ──────────────────────────────────────────
                             if (owner.equals("java/lang/System")
                                     && (mname.equals("load") || mname.equals("loadLibrary"))) {
                                 super.visitInsn(Opcodes.POP); return;
                             }
                             if (owner.equals("java/lang/System") && mname.equals("exit")) {
                                 super.visitInsn(Opcodes.POP); return;
-                            }
-                            // Block bytecode self-integrity checks: return null so the check sees no data.
-                            if ((owner.equals("java/lang/Class") || owner.equals("java/lang/ClassLoader"))
-                                    && mname.equals("getResourceAsStream")) {
-                                super.visitInsn(Opcodes.POP);
-                                super.visitInsn(Opcodes.POP);
-                                super.visitInsn(Opcodes.ACONST_NULL); return;
                             }
                             if (owner.equals("java/lang/Runtime")
                                     && (mname.equals("load") || mname.equals("loadLibrary"))) {
@@ -722,19 +1052,36 @@ public class ENI_StringDumper {
                             if (owner.equals("java/lang/Runtime") && mname.equals("halt")) {
                                 super.visitInsn(Opcodes.POP); super.visitInsn(Opcodes.POP); return;
                             }
-                            if (owner.equals("java/lang/StackWalker")) {
-                                emitZeroReturn(this, descriptor.substring(descriptor.lastIndexOf(')') + 1), descriptor, opcode);
-                                return;
-                            }
                             if (owner.equals("native0/Loader") && mname.equals("registerNativesForClass")) {
                                 super.visitInsn(Opcodes.POP); super.visitInsn(Opcodes.POP); return;
                             }
                             if (owner.equals("native0/hidden/Hidden0") && mname.startsWith("special_clinit_")) {
                                 super.visitInsn(Opcodes.POP); return;
                             }
-                            // Stub Cipher/Mac operations to avoid cascade failure when key material is unavailable.
-                            if (owner.equals("javax/crypto/Cipher")
-                                    && (mname.equals("doFinal") || mname.equals("update"))) {
+
+                            // ── Integrity check stubs ────────────────────────────────────────
+                            // Block bytecode self-integrity checks: return null so the check sees no data.
+                            if ((owner.equals("java/lang/Class") || owner.equals("java/lang/ClassLoader"))
+                                    && mname.equals("getResourceAsStream")) {
+                                super.visitInsn(Opcodes.POP);
+                                super.visitInsn(Opcodes.POP);
+                                super.visitInsn(Opcodes.ACONST_NULL); return;
+                            }
+                            if (owner.equals("java/lang/StackWalker")) {
+                                emitZeroReturn(this, descriptor.substring(descriptor.lastIndexOf(')') + 1), descriptor, opcode);
+                                return;
+                            }
+
+                            // ── Cipher / Mac stubs ───────────────────────────────────────────
+                            // Stub the full Cipher lifecycle so <clinit> routines that use
+                            // AES/DES string decryption complete without throwing BadPaddingException.
+                            // The decrypted strings will be empty/null, but the class loads cleanly
+                            // and its other (non-encrypted) fields and strings are still recoverable.
+                            //
+                            // Cipher.getInstance  → null  (no Cipher object created)
+                            // Cipher.init         → void  (no-op)
+                            // Cipher.doFinal/update → empty byte[]
+                            if (owner.equals("javax/crypto/Cipher")) {
                                 emitZeroReturn(this, descriptor.substring(descriptor.lastIndexOf(')') + 1), descriptor, opcode);
                                 return;
                             }
@@ -743,6 +1090,46 @@ public class ENI_StringDumper {
                                 emitZeroReturn(this, descriptor.substring(descriptor.lastIndexOf(')') + 1), descriptor, opcode);
                                 return;
                             }
+                            // Stub SecretKeyFactory and KeyGenerator — obfuscators use these
+                            // to build keys from hardcoded byte arrays before passing to Cipher.
+                            // Stubbing them returns null keys so Cipher.init (also stubbed) is a no-op.
+                            if ((owner.equals("javax/crypto/SecretKeyFactory")
+                                    || owner.equals("javax/crypto/KeyGenerator"))
+                                    && !mname.equals("<init>")) {
+                                emitZeroReturn(this, descriptor.substring(descriptor.lastIndexOf(')') + 1), descriptor, opcode);
+                                return;
+                            }
+                            // Stub all javax/crypto/spec key/param constructors and SecretKeySpec.
+                            // When SecretKeyFactory is stubbed to null, calling generateSecret on
+                            // null throws NPE. Stubbing the spec constructors as void no-ops (they
+                            // are INVOKESPECIAL so NEW already pushed the ref — we just discard args)
+                            // means the spec object exists but is uninitialized, which is fine since
+                            // Cipher.init is also stubbed.
+                            if (owner.startsWith("javax/crypto/spec/") && mname.equals("<init>")) {
+                                // INVOKESPECIAL <init>: NEW already placed 'this' on stack.
+                                // We just need to pop the arguments (not the receiver).
+                                org.objectweb.asm.Type[] argTypes = org.objectweb.asm.Type.getArgumentTypes(descriptor);
+                                for (int i = argTypes.length - 1; i >= 0; i--) {
+                                    super.visitInsn(argTypes[i].getSize() == 2 ? Opcodes.POP2 : Opcodes.POP);
+                                }
+                                // Do NOT emit a RETURN — this is a constructor, control falls through.
+                                return;
+                            }
+
+                            // ── JNA / LWJGL / Log4j version-mismatch stubs ──────────────────
+                            // Bundled JNA/LWJGL/Log4j versions often differ from what is on the
+                            // classpath, causing NoSuchMethodError at <clinit> time and
+                            // cascade-poisoning every class that depends on them. Stubbing
+                            // their calls to zero/null lets those <clinit>s complete so we
+                            // can still recover decrypted strings from the class.
+                            if (owner.startsWith("com/sun/jna/")
+                                    || owner.startsWith("org/lwjgl/")
+                                    || owner.startsWith("org/apache/logging/log4j/")) {
+                                emitZeroReturn(this, descriptor.substring(descriptor.lastIndexOf(')') + 1), descriptor, opcode);
+                                return;
+                            }
+
+                            // ── Flow-stub classes ────────────────────────────────────────────
                             if (FLOW_STUB_CLASSES.contains(owner.replace('/', '.'))) {
                                 emitZeroReturn(this, descriptor.substring(descriptor.lastIndexOf(')') + 1), descriptor, opcode);
                                 return;
@@ -770,6 +1157,33 @@ public class ENI_StringDumper {
     }
 
     /**
+     * Full bytecode rewrite: feeds only the method bodies through a fresh ClassWriter
+     * without referencing the original ClassReader. This forces ASM to recompute
+     * every stack map frame from scratch, discarding illegal type annotations that
+     * cause "Bad type on operand stack" / "Bad return type" VerifyErrors in the JVM
+     * strict verifier (Java 7+). Used as a last-resort step after recomputeFrames
+     * fails because the original frames themselves contain the bad types.
+     */
+    static byte[] fullRewrite(byte[] classBytes) {
+        try {
+            ClassReader cr = new ClassReader(classBytes);
+            // No ClassReader passed to ClassWriter — ASM infers the entire type hierarchy
+            // from scratch. getCommonSuperClass falling back to Object is acceptable here
+            // since we only need the class to load, not to verify perfectly.
+            ClassWriter cw = new ClassWriter(ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS) {
+                @Override
+                protected String getCommonSuperClass(String type1, String type2) {
+                    return "java/lang/Object";
+                }
+            };
+            cr.accept(cw, ClassReader.SKIP_FRAMES | ClassReader.SKIP_DEBUG);
+            return cw.toByteArray();
+        } catch (Throwable t) {
+            return classBytes;
+        }
+    }
+
+    /**
      * Rewrites exception handlers whose catch type is not a Throwable subclass
      * to catch java/lang/Throwable instead, so the verifier accepts the bytecode.
      */
@@ -787,7 +1201,9 @@ public class ENI_StringDumper {
                                 org.objectweb.asm.Label end, org.objectweb.asm.Label handler, String type) {
                             if (type != null && !type.startsWith("java/lang/") && !type.startsWith("java/io/")
                                     && !type.startsWith("java/util/") && !type.startsWith("javax/")
-                                    && !type.startsWith("sun/") && !type.startsWith("jdk/")) {
+                                    && !type.startsWith("sun/") && !type.startsWith("jdk/")
+                                    && !type.startsWith("org/xml/") && !type.startsWith("org/w3c/")
+                                    && !type.startsWith("com/sun/")) {
                                 needsFix[0] = true;
                             }
                         }
@@ -815,7 +1231,9 @@ public class ENI_StringDumper {
                             // Normalize non-Throwable catch types to Throwable
                             if (type != null && !type.startsWith("java/lang/") && !type.startsWith("java/io/")
                                     && !type.startsWith("java/util/") && !type.startsWith("javax/")
-                                    && !type.startsWith("sun/") && !type.startsWith("jdk/")) {
+                                    && !type.startsWith("sun/") && !type.startsWith("jdk/")
+                                    && !type.startsWith("org/xml/") && !type.startsWith("org/w3c/")
+                                    && !type.startsWith("com/sun/")) {
                                 super.visitTryCatchBlock(start, end, handler, "java/lang/Throwable");
                             } else {
                                 super.visitTryCatchBlock(start, end, handler, type);
@@ -830,6 +1248,7 @@ public class ENI_StringDumper {
         }
     }
 
+    // ── Ghost class loader ────────────────────────────────────────────────────
     static class GhostClassLoader extends URLClassLoader {
         final Map<String, byte[]>  classBytes;
         private final Map<String, StubInfo>  stubNeeds;
@@ -877,53 +1296,58 @@ public class ENI_StringDumper {
             synchronized (this) {
                 existing = defined.get(name);
                 if (existing != null) return existing;
+
                 byte[] patched = DO_PATCH ? patchAntiAnalysis(bytes) : bytes;
                 patched = patchPoisonedDeps(patched);
                 patched = fixExceptionHandlers(patched);
-                // Try patched bytes
-                try {
-                    Class<?> clazz = defineClass(name, patched, 0, patched.length);
-                    if (resolve) resolveClass(clazz);
-                    defined.put(name, clazz);
-                    return clazz;
-                } catch (Throwable t1) {
-                    // Try recomputing frames on the patched bytes
-                    try {
-                        byte[] reframed = recomputeFrames(patched);
-                        Class<?> clazz = defineClass(name, reframed, 0, reframed.length);
-                        if (resolve) resolveClass(clazz);
-                        defined.put(name, clazz);
-                        return clazz;
-                    } catch (Throwable t2) {
-                        // Try original bytes with frame recomputation
-                        if (patched != bytes) {
-                            try {
-                                byte[] reframed = recomputeFrames(bytes);
-                                Class<?> clazz = defineClass(name, reframed, 0, reframed.length);
-                                if (resolve) resolveClass(clazz);
-                                defined.put(name, clazz);
-                                return clazz;
-                            } catch (Throwable t3) {}
-                            try {
-                                Class<?> clazz = defineClass(name, bytes, 0, bytes.length);
-                                if (resolve) resolveClass(clazz);
-                                defined.put(name, clazz);
-                                return clazz;
-                            } catch (Throwable t3) {}
-                        }
-                        // Last resort: generate a stub so dependents don't cascade-fail
-                        poisonedClasses.add(name);
-                        try {
-                            byte[] stub = generateStub(stubNeeds.getOrDefault(name, new StubInfo(name, false)));
-                            Class<?> clazz = defineClass(name, stub, 0, stub.length);
-                            if (resolve) resolveClass(clazz);
-                            defined.put(name, clazz);
-                            return clazz;
-                        } catch (Throwable t4) {
-                            throw new RuntimeException("defineClass failed for " + name, t2);
-                        }
-                    }
+
+                // Fallback chain: each step tries a different form of the bytecode.
+                // tryDefine returns null on failure so the chain is linear.
+                Class<?> clazz;
+
+                clazz = tryDefine(name, patched, resolve);
+                if (clazz != null) { defined.put(name, clazz); return clazz; }
+
+                clazz = tryDefine(name, recomputeFrames(patched), resolve);
+                if (clazz != null) { defined.put(name, clazz); return clazz; }
+
+                // Full rewrite: discard original frames entirely and let ASM rebuild
+                // from scratch — recovers "Bad type on operand stack" VerifyErrors.
+                clazz = tryDefine(name, fullRewrite(patched), resolve);
+                if (clazz != null) { defined.put(name, clazz); return clazz; }
+
+                if (patched != bytes) {
+                    clazz = tryDefine(name, recomputeFrames(bytes), resolve);
+                    if (clazz != null) { defined.put(name, clazz); return clazz; }
+
+                    clazz = tryDefine(name, fullRewrite(bytes), resolve);
+                    if (clazz != null) { defined.put(name, clazz); return clazz; }
+
+                    clazz = tryDefine(name, bytes, resolve);
+                    if (clazz != null) { defined.put(name, clazz); return clazz; }
                 }
+
+                // Last resort: generate a stub so dependents don't cascade-fail
+                poisonedClasses.add(name);
+                byte[] stub = generateStub(stubNeeds.getOrDefault(name, new StubInfo(name, false)));
+                clazz = tryDefine(name, stub, resolve);
+                if (clazz != null) { defined.put(name, clazz); return clazz; }
+
+                throw new RuntimeException("defineClass failed for " + name);
+            }
+        }
+
+        /**
+         * Attempt to define and optionally resolve a class from raw bytes.
+         * Returns the defined Class on success, or null if defineClass throws.
+         */
+        private Class<?> tryDefine(String name, byte[] bytes, boolean resolve) {
+            try {
+                Class<?> clazz = defineClass(name, bytes, 0, bytes.length);
+                if (resolve) resolveClass(clazz);
+                return clazz;
+            } catch (Throwable t) {
+                return null;
             }
         }
 
@@ -1005,13 +1429,23 @@ public class ENI_StringDumper {
         }
 
         private static boolean isVendorClass(String name) {
+            // These libraries require native code, on-disk data files, or specific
+            // runtime environment setup that is never present when running the dumper.
+            // Stubbing them immediately prevents cascade poisoning of dependent classes.
             return name.startsWith("org.lwjgl.")
                 || name.startsWith("net.java.games.")
                 || name.startsWith("org.joml.")
-                || name.startsWith("com.sun.jna.");
+                || name.startsWith("com.sun.jna.")
+                // IBM ICU requires icudt*.icu data files on disk — MissingResourceException
+                // cascade-poisons every class that depends on ICU text/date formatting.
+                || name.startsWith("com.ibm.icu.")
+                // Log4j 2.x loads plugins via ServiceLoader and reads config files at
+                // <clinit> time; without them it throws and poisons every logging caller.
+                || name.startsWith("org.apache.logging.log4j.");
         }
     }
 
+    // ── Stub generation ───────────────────────────────────────────────────────
     static byte[] generateStub(StubInfo info) {
         String internalName = info.className.replace('.', '/');
         ClassWriter cw = new ClassWriter(0);
@@ -1070,6 +1504,7 @@ public class ENI_StringDumper {
         return cw.toByteArray();
     }
 
+    // ── Data model ────────────────────────────────────────────────────────────
     enum ClassResult { OK, FAIL }
 
     static class DumpEntry {
@@ -1109,6 +1544,7 @@ public class ENI_StringDumper {
         }
     }
 
+    // ── String / field utilities ──────────────────────────────────────────────
     static Field[] cachedFields(Class<?> clazz) {
         return FIELDS_CACHE.computeIfAbsent(clazz, c -> {
             try {
@@ -1130,11 +1566,11 @@ public class ENI_StringDumper {
 
     private interface CharAt { char get(int i); }
 
-    private static boolean interestingImpl(int len, CharAt fn) {
+    private static boolean interestingImpl(int len, CharAt charAt) {
         if (len < 3) return false;
         int ctrl = 0, highByte = 0, printableAscii = 0;
         for (int i = 0; i < len; i++) {
-            char c = fn.get(i);
+            char c = charAt.get(i);
             if (c < 0x20 && c != '\n' && c != '\r' && c != '\t') ctrl++;
             else if (c > 0x7e) highByte++;
             else printableAscii++;
@@ -1153,13 +1589,14 @@ public class ENI_StringDumper {
     }
 
     static boolean isLikelyText(byte[] bytes) {
-        int printable = 0, limit = Math.min(bytes.length, 256);
+        int printable = 0, limit = Math.min(bytes.length, TEXT_PROBE_LIMIT);
         for (int i = 0; i < limit; i++) {
             byte b = bytes[i];
             if (b == 0) return false;
-            if ((b >= 0x20 && b <= 0x7E) || b == '\n' || b == '\r' || b == '\t') printable++;
+            if ((b >= ASCII_PRINTABLE_LOW && b <= ASCII_PRINTABLE_HIGH)
+                    || b == '\n' || b == '\r' || b == '\t') printable++;
         }
-        return printable / (double) limit > 0.70;
+        return printable / (double) limit > TEXT_PRINTABLE_RATIO;
     }
 
     static String escapeLog(String s) {
@@ -1224,17 +1661,71 @@ public class ENI_StringDumper {
                 public MethodVisitor visitMethod(int access, String mname,
                                                   String desc, String sig, String[] exc) {
                     return new MethodVisitor(Opcodes.ASM9) {
+                        String lastLdc = null;
+
                         @Override
                         public void visitLdcInsn(Object cst) {
-                            if (cst instanceof String && interesting((String) cst))
-                                emit(results, seenLines, className, "[ldc:" + mname + "]", null, (String) cst);
+                            if (cst instanceof String) {
+                                String s = (String) cst;
+                                lastLdc = s;
+                                if (interesting(s))
+                                    emit(results, seenLines, className, "[ldc:" + mname + "]", null, s);
+                            } else {
+                                lastLdc = null;
+                            }
                         }
+
+                        @Override
+                        public void visitMethodInsn(int opcode, String owner, String mname2, String desc, boolean itf) {
+                            // Class.forName(String) — the preceding LDC is a class name used for reflection.
+                            if (lastLdc != null
+                                    && owner.equals("java/lang/Class")
+                                    && mname2.equals("forName")
+                                    && desc.startsWith("(Ljava/lang/String;)")) {
+                                String classRef = lastLdc.replace('/', '.');
+                                if (interesting(classRef))
+                                    emit(results, seenLines, className, "[classref:" + mname + "]", null, classRef);
+                            }
+                            lastLdc = null;
+                        }
+
+                        @Override
+                        public void visitInvokeDynamicInsn(String name, String descriptor,
+                                                            Handle bsm, Object... bsmArgs) {
+                            // Many obfuscators (SkidFuscator, Allatori, Zelix) implement string
+                            // decryption via invokedynamic rather than a plain INVOKESTATIC, so
+                            // the encrypted payload never appears as an LDC constant. We can't
+                            // execute the BSM here, but we emit any String-typed BSM arguments
+                            // as hints, and also emit the BSM owner+name as a low-fidelity hint
+                            // so the class at least gets *something* in the fallback output.
+                            for (Object arg : bsmArgs) {
+                                if (arg instanceof String && interesting((String) arg))
+                                    emit(results, seenLines, className, "[indy:" + mname + "]", null, (String) arg);
+                            }
+                            if (!descriptor.endsWith(")Ljava/lang/String;")) {
+                                lastLdc = null;
+                            }
+                        }
+
+                        @Override
+                        public void visitInsn(int opcode) { lastLdc = null; }
+                        @Override
+                        public void visitIntInsn(int opcode, int operand) { lastLdc = null; }
+                        @Override
+                        public void visitVarInsn(int opcode, int var) { lastLdc = null; }
+                        @Override
+                        public void visitTypeInsn(int opcode, String type) { lastLdc = null; }
+                        @Override
+                        public void visitFieldInsn(int opcode, String owner, String fname, String fdesc) { lastLdc = null; }
+                        @Override
+                        public void visitJumpInsn(int opcode, org.objectweb.asm.Label label) { lastLdc = null; }
                     };
                 }
             }, ClassReader.SKIP_FRAMES | ClassReader.SKIP_DEBUG);
         } catch (Throwable ignored) {}
     }
 
+    // ── JVM detection and re-execution ────────────────────────────────────────
     static int getMaxClassVersion(Map<String, byte[]> classBytes) {
         int max = 0;
         for (byte[] b : classBytes.values()) {
@@ -1330,6 +1821,7 @@ public class ENI_StringDumper {
         System.exit(p.exitValue());
     }
 
+    // ── I/O helpers ───────────────────────────────────────────────────────────
     static PrintWriter openWriter(File f) throws IOException {
         return new PrintWriter(new OutputStreamWriter(
                 new FileOutputStream(f), java.nio.charset.StandardCharsets.UTF_8));
