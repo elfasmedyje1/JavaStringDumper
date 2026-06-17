@@ -84,27 +84,3 @@ Source tags in the package logs indicate how each string was recovered:
 ```
 java -cp .;asm-9.8.jar ENI_StringDumper -json -threads 8 someobfuscated.jar
 ```
-
----
-
-## How it works
-
-1. **Dependency analysis** — scans all class bytecode to build a dependency graph and identify missing external classes that need stubs
-2. **Topological sort** — processes classes in dependency order to minimise cascade failures
-3. **Multithreaded loading** — loads and initialises classes in parallel, triggering `<clinit>` to run decryption routines
-4. **Anti-analysis patching** — rewrites bytecode before loading to neutralise common obfuscation guards:
-   - Timing checks (`nanoTime`, `currentTimeMillis`, `Thread.getId`, `Thread.threadId`) → stable constants
-   - Stack inspection (`getStackTrace`, `getCallerClass`, `StackWalker`) → empty/null
-   - Native loads (`System.load`, `Runtime.loadLibrary`) → no-ops
-   - Unsafe memory ops → zero returns
-   - Cipher lifecycle (`Cipher`, `SecretKeyFactory`, `javax.crypto.spec.*`) → stubs so `BadPaddingException` does not cascade
-   - JNA / LWJGL / Log4j version-mismatch calls → zero returns
-   - Bytecode integrity checks (`Class.getResourceAsStream`) → null
-5. **Ghost class stubs** — generates minimal stub classes for missing dependencies so the target JAR loads even without its full runtime environment
-6. **Poison propagation patching** — tracks classes whose `<clinit>` failed and patches out `GETSTATIC`/`INVOKESTATIC` references to them in dependents
-7. **Multi-tier defineClass fallback** — patched bytes → recomputed frames → full ASM rewrite → original bytes → stub, in that order
-8. **Single-thread retry** — after the parallel pass, classes that failed are retried single-threaded in topological order to recover from race conditions
-9. **String array index pass** — scans bytecode for `GETSTATIC String[] + int + AALOAD` patterns and attributes the resolved string to the accessing class
-10. **`invokedynamic` BSM execution** — attempts to reflectively bootstrap `invokedynamic` call sites that return `String` to recover runtime-decrypted values
-11. **Brute-force decryptors** — calls static `(int) -> String` and `(long) -> String` methods with indices 0..brutemax to extract index-based string tables
-12. **LDC fallback** — for classes that fail entirely, extracts raw string constants from the constant pool including `invokedynamic` BSM arguments and `Class.forName` reflection anchors
